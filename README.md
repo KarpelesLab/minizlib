@@ -133,7 +133,7 @@ any panic machinery: malformed input of any kind is reported as an `Error`.
 
 Huffman codes are decoded canonically, one bit at a time, straight from the
 count of codes of each length, in the manner of zlib's `puff`. It is slower
-than the usual lookup tables (expect around 100 MB/s on a desktop core at
+than the usual lookup tables (expect around 80 MB/s on a desktop core at
 `opt-level = "z"`), but it needs next to no code, no table building, and little
 stack (1.3 KiB measured on Thumb-2). Length and distance bases are computed
 rather than tabulated. Checksums are fed in bulk when the output is flushed
