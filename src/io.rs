@@ -180,7 +180,8 @@ impl Output for Buffer<'_> {
     #[inline]
     fn copy<C: Checksum>(&mut self, dist: usize, len: usize, _: &mut C) -> Result<(), Error> {
         let start = self.pos.checked_sub(dist).ok_or(Error::InvalidDistance)?;
-        let end = self.pos.saturating_add(len);
+        // Should this wrap around, the range is invalid and gets refused.
+        let end = self.pos.wrapping_add(len);
         let region = self.buf.get_mut(start..end).ok_or(Error::OutputFull)?;
         for i in dist..region.len() {
             region[i] = region[i - dist];

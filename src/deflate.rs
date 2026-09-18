@@ -26,6 +26,9 @@ pub(crate) struct Inflate<'a, I, O, C> {
     pub(crate) check: C,
     bit_buf: u32,
     bit_cnt: u32,
+    /// The first failure of the input. From then on it reads as zeros, which
+    /// spares an error path at every read; see `bits`.
+    status: Result<(), Error>,
 }
 
 /// A canonical Huffman code: `count[n]` codes of `n` bits each, and the
@@ -98,38 +101,58 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
             check,
             bit_buf: 0,
             bit_cnt: 0,
+            status: Ok(()),
         }
+    }
+
+    /// Runs `decode`, then reports the failure of the input if there was one,
+    /// rather than whatever was made of the zeros read past it.
+    pub(crate) fn run(
+        &mut self,
+        decode: impl FnOnce(&mut Self) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let result = decode(self);
+        self.status.and(result)
     }
 
     /// Reads `need` bits, at most 16, least significant first.
     ///
-    /// The result is kept to 16 bits so that it comes back in a register.
-    pub(crate) fn bits(&mut self, need: u32) -> Result<u16, Error> {
+    /// This cannot fail: once the input has, it is not asked again, `status`
+    /// holds its error, and zeros are read. Callers only have to make sure
+    /// that zeros get them to `run`'s verdict, without looping forever and
+    /// without producing any output on the way. Zeros end every header field
+    /// and make for an invalid stored block; the loops that could go on, or
+    /// output something, check `status`.
+    pub(crate) fn bits(&mut self, need: u32) -> u16 {
         while self.bit_cnt < need {
-            self.bit_buf |= (self.input.byte()? as u32) << self.bit_cnt;
+            if self.status.is_ok() {
+                match self.input.byte() {
+                    Ok(byte) => self.bit_buf |= (byte as u32) << self.bit_cnt,
+                    Err(error) => self.status = Err(error),
+                }
+            }
             self.bit_cnt += 8;
         }
         let value = self.bit_buf & ((1 << need) - 1);
         self.bit_buf >>= need;
         self.bit_cnt -= need;
-        Ok(value as u16)
+        value as u16
     }
 
     /// Skips `bytes` bytes. Only valid on a byte boundary.
     #[cfg(feature = "gzip")]
-    pub(crate) fn skip(&mut self, bytes: u16) -> Result<(), Error> {
+    pub(crate) fn skip(&mut self, bytes: u16) {
         for _ in 0..bytes {
-            self.bits(8)?;
+            self.bits(8);
         }
-        Ok(())
     }
 
     /// Decodes one raw deflate stream and flushes the output. Leaves the input
     /// right after the stream, on a byte boundary.
     pub(crate) fn inflate(&mut self) -> Result<(), Error> {
         loop {
-            let last = self.bits(1)? != 0;
-            match self.bits(2)? {
+            let last = self.bits(1) != 0;
+            match self.bits(2) {
                 #[cfg(feature = "stored")]
                 0 => self.stored()?,
                 #[cfg(feature = "fixed")]
@@ -155,12 +178,13 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         // Skip to the next byte boundary.
         self.bit_buf = 0;
         self.bit_cnt = 0;
-        let len = self.bits(16)?;
-        if self.bits(16)? != !len {
+        let len = self.bits(16);
+        if self.bits(16) != !len {
             return Err(Error::InvalidBlock);
         }
         for _ in 0..len {
-            let byte = self.bits(8)? as u8;
+            let byte = self.bits(8) as u8;
+            self.status?;
             self.out.put(byte, &mut self.check)?;
         }
         Ok(())
@@ -168,12 +192,19 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
 
     #[cfg(feature = "fixed")]
     fn fixed(&mut self) -> Result<(), Error> {
-        let mut lengths = [8u8; MAX_SYMS];
-        lengths[144..256].fill(9);
-        lengths[256..280].fill(7);
-        // All 32 five-bit distance codes, to make the code complete. The last
-        // two are rejected when they come up.
-        lengths[MAX_LEN_SYMS..].fill(5);
+        // Code lengths, by runs of symbols: the literals/lengths, then all 32
+        // five-bit distance codes, to make that code complete. The last two
+        // are rejected when they come up.
+        const RUNS: [(u8, u8); 5] = [(144, 8), (112, 9), (24, 7), (8, 8), (32, 5)];
+        let mut lengths = [0u8; MAX_SYMS];
+        let mut rest = &mut lengths[..];
+        for (count, len) in RUNS {
+            let Some((run, tail)) = rest.split_at_mut_checked(count as usize) else {
+                break;
+            };
+            run.fill(len);
+            rest = tail;
+        }
         self.compressed(&lengths, MAX_LEN_SYMS).map(drop)
     }
 
@@ -184,16 +215,16 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
             16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
         ];
 
-        let len_syms = self.bits(5)? as usize + 257;
-        let dist_syms = self.bits(5)? as usize + 1;
-        let code_syms = self.bits(4)? as usize + 4;
+        let len_syms = self.bits(5) as usize + 257;
+        let dist_syms = self.bits(5) as usize + 1;
+        let code_syms = self.bits(4) as usize + 4;
         if len_syms > 286 || dist_syms > 30 {
             return Err(Error::InvalidBlock);
         }
 
         let mut lengths = [0u8; MAX_SYMS];
         for &sym in ORDER.iter().take(code_syms) {
-            lengths[(sym & 31) as usize] = self.bits(3)? as u8;
+            lengths[(sym & 31) as usize] = self.bits(3) as u8;
         }
         let mut symbol = [0; 19];
         let mut code = Huffman::new(&mut symbol);
@@ -215,10 +246,10 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
                     let prev = *lengths
                         .get(index.wrapping_sub(1))
                         .ok_or(Error::InvalidCode)?;
-                    (prev, 3 + self.bits(2)?)
+                    (prev, 3 + self.bits(2))
                 }
-                17 => (0, 3 + self.bits(3)?),
-                _ => (0, 11 + self.bits(7)?),
+                17 => (0, 3 + self.bits(3)),
+                _ => (0, 11 + self.bits(7)),
             };
             let end = index + repeat as usize;
             lengths
@@ -274,7 +305,7 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
                 0..=3 => sym + 3,
                 4..=27 => {
                     let extra = (sym - 4) >> 2;
-                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra)? as u32
+                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra) as u32
                 }
                 28 => 258,
                 _ => return Err(Error::InvalidCode),
@@ -287,11 +318,12 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
                 0..=1 => sym + 1,
                 2..=29 => {
                     let extra = (sym - 2) >> 1;
-                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra)? as u32
+                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra) as u32
                 }
                 _ => return Err(Error::InvalidCode),
             };
 
+            self.status?;
             self.out
                 .copy(dist as usize, len as usize, &mut self.check)?;
         }
@@ -304,8 +336,10 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         let mut index = 0i32;
         for &count in &code.count[1..] {
             let count = count as i32;
-            bits |= self.bits(1)? as i32;
+            bits |= self.bits(1) as i32;
             if bits - count < first {
+                // Checked here for the sake of the callers' loops.
+                self.status?;
                 return code
                     .symbol
                     .get((index + bits - first) as usize)

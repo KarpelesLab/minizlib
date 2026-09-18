@@ -48,52 +48,52 @@ fn member<I: Input, O: Output>(input: &mut I, out: &mut O) -> Result<(), Error> 
     let (check, start) = (Crc32::new(), out.written());
     #[cfg(not(feature = "checksum"))]
     let check = ();
-    let mut state = Inflate::new(input, out, check);
-
-    // ID2 and CM.
-    match state.bits(16)? {
-        0x088b => {}
-        other if other as u8 == 0x8b => return Err(Error::Unsupported),
-        _ => return Err(Error::InvalidHeader),
-    }
-    let flags = state.bits(8)?;
-    if flags & RESERVED != 0 {
-        return Err(Error::InvalidHeader);
-    }
-    // MTIME, XFL and OS, then the extra field.
-    state.skip(6)?;
-    if flags & FEXTRA != 0 {
-        let len = state.bits(16)?;
-        state.skip(len)?;
-    }
-    for field in [FNAME, FCOMMENT] {
-        if flags & field != 0 {
-            while state.bits(8)? != 0 {}
+    Inflate::new(input, out, check).run(|state| {
+        // ID2 and CM.
+        match state.bits(16) {
+            0x088b => {}
+            other if other as u8 == 0x8b => return Err(Error::Unsupported),
+            _ => return Err(Error::InvalidHeader),
         }
-    }
-    if flags & FHCRC != 0 {
-        // The header CRC is not verified: gzip never writes one.
-        state.skip(2)?;
-    }
+        let flags = state.bits(8);
+        if flags & RESERVED != 0 {
+            return Err(Error::InvalidHeader);
+        }
+        // MTIME, XFL and OS, then the extra field.
+        state.skip(6);
+        if flags & FEXTRA != 0 {
+            let len = state.bits(16);
+            state.skip(len);
+        }
+        for field in [FNAME, FCOMMENT] {
+            if flags & field != 0 {
+                while state.bits(8) != 0 {}
+            }
+        }
+        if flags & FHCRC != 0 {
+            // The header CRC is not verified: gzip never writes one.
+            state.skip(2);
+        }
 
-    state.inflate()?;
+        state.inflate()?;
 
-    // CRC-32 and ISIZE, as four little-endian halves.
-    let mut trailer = [0; 4];
-    for half in &mut trailer {
-        *half = state.bits(16)?;
-    }
-    #[cfg(feature = "checksum")]
-    {
-        let [crc_low, crc_high, size_low, size_high] = trailer.map(u32::from);
-        let size = (state.out.written() - start) as u32;
-        if (O::VERIFY && crc_high << 16 | crc_low != state.check.value())
-            || size_high << 16 | size_low != size
+        // CRC-32 and ISIZE, as four little-endian halves.
+        let mut trailer = [0; 4];
+        for half in &mut trailer {
+            *half = state.bits(16);
+        }
+        #[cfg(feature = "checksum")]
         {
-            return Err(Error::ChecksumMismatch);
+            let [crc_low, crc_high, size_low, size_high] = trailer.map(u32::from);
+            let size = (state.out.written() - start) as u32;
+            if (O::VERIFY && crc_high << 16 | crc_low != state.check.value())
+                || size_high << 16 | size_low != size
+            {
+                return Err(Error::ChecksumMismatch);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Decodes a zlib stream whose first byte, `first`, was already read.
@@ -109,27 +109,27 @@ pub(crate) fn zlib<I: Input, O: Output>(
     let check = Adler32::new();
     #[cfg(not(feature = "checksum"))]
     let check = ();
-    let mut state = Inflate::new(input, out, check);
+    Inflate::new(input, out, check).run(|state| {
+        let flags = state.bits(8);
+        if !(first as u16 * 256 + flags).is_multiple_of(31) {
+            return Err(Error::InvalidHeader);
+        }
+        // Deflate with a window of at most 32 KiB, and no preset dictionary.
+        if first & 0x0f != 8 || first >> 4 > 7 || flags & FDICT != 0 {
+            return Err(Error::Unsupported);
+        }
 
-    let flags = state.bits(8)?;
-    if !(first as u16 * 256 + flags).is_multiple_of(31) {
-        return Err(Error::InvalidHeader);
-    }
-    // Deflate with a window of at most 32 KiB, and no preset dictionary.
-    if first & 0x0f != 8 || first >> 4 > 7 || flags & FDICT != 0 {
-        return Err(Error::Unsupported);
-    }
+        state.inflate()?;
 
-    state.inflate()?;
-
-    // Adler-32, as two big-endian halves.
-    let high = state.bits(16)?.swap_bytes();
-    let low = state.bits(16)?.swap_bytes();
-    #[cfg(feature = "checksum")]
-    if O::VERIFY && (high as u32) << 16 | low as u32 != state.check.value() {
-        return Err(Error::ChecksumMismatch);
-    }
-    #[cfg(not(feature = "checksum"))]
-    let _ = (high, low);
-    Ok(())
+        // Adler-32, as two big-endian halves.
+        let high = state.bits(16).swap_bytes();
+        let low = state.bits(16).swap_bytes();
+        #[cfg(feature = "checksum")]
+        if O::VERIFY && (high as u32) << 16 | low as u32 != state.check.value() {
+            return Err(Error::ChecksumMismatch);
+        }
+        #[cfg(not(feature = "checksum"))]
+        let _ = (high, low);
+        Ok(())
+    })
 }

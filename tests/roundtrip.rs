@@ -535,6 +535,24 @@ fn truncation() {
                 to_stream(|i, o| gunzip(i, o), &gz[..len], 32_768),
                 Err(Error::UnexpectedEof)
             );
+
+            // Nothing made up past the end of the input reaches the output,
+            // and an input that has ended is left alone.
+            let mut out = vec![0; data.len()];
+            let mut buffer = Buffer::new(&mut out);
+            let mut rest = &gz[..len];
+            let mut ended = false;
+            let mut scratch = [0; 16];
+            let reader = Reader::new(&mut scratch, |buf| {
+                assert!(!ended, "read again after the end");
+                let n = rest.len().min(buf.len());
+                buf[..n].copy_from_slice(&rest[..n]);
+                rest = &rest[n..];
+                ended = n == 0;
+                Ok(n)
+            });
+            assert_eq!(gunzip(reader, &mut buffer), Err(Error::UnexpectedEof));
+            assert!(data.starts_with(buffer.filled()), "{len} of {}", gz.len());
         }
     }
 }

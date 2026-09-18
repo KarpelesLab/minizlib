@@ -3,7 +3,7 @@
 A tiny gzip / zlib / deflate decompressor for Rust: `no_std`, no allocation,
 no `unsafe`, no dependencies, no panics, and as little code as possible.
 
-Full gzip support links to **under 3 KB** of Thumb-2 code, and features let
+Full gzip support links to **under 2.5 KB** of Thumb-2 code, and features let
 you strip that down further. Buffer in or stream in, buffer out or stream out,
 and go.
 
@@ -115,17 +115,17 @@ table, and CI runs it to keep the no-panic guarantee honest.
 
 | configuration                                   | bytes |
 |-------------------------------------------------|------:|
-| gzip, default features                          |  2896 |
-| … with `crc-table`                              |  3846 |
-| … without `concat`                              |  2698 |
-| … without `concat` and `checksum`               |  2559 |
-| gzip, `dynamic` blocks only                     |  2157 |
-| gzip, `fixed` blocks only                       |  1716 |
-| gzip, `stored` blocks only                      |   710 |
-| stream in / stream out, default features        |  3186 |
-| length only, default features                   |  2849 |
+| gzip, default features                          |  2424 |
+| … with `crc-table`                              |  3368 |
+| … without `concat`                              |  2310 |
+| … without `concat` and `checksum`               |  2103 |
+| gzip, `dynamic` blocks only                     |  1895 |
+| gzip, `fixed` blocks only                       |  1582 |
+| gzip, `stored` blocks only                      |   506 |
+| stream in / stream out, default features        |  2752 |
+| length only, default features                   |  2267 |
 
-About 600 of those bytes are the `memset` / `memclr` routines of
+About 400 of those bytes are the `memset` / `memclr` routines of
 `compiler_builtins`, which most firmware links anyway. No configuration links
 any panic machinery: malformed input of any kind is reported as an `Error`.
 
@@ -138,6 +138,15 @@ than the usual lookup tables (expect around 100 MB/s on a desktop core at
 stack (1.3 KiB measured on Thumb-2). Length and distance bases are computed
 rather than tabulated. Checksums are fed in bulk when the output is flushed
 rather than byte by byte.
+
+A few things matter more than they look, on a 32-bit target. Everything,
+container headers and trailers included, is read through one primitive that
+returns sixteen bits at most: a `Result<u16, Error>` comes back in a register,
+where a `Result<u32, Error>` goes through the stack at every call site. That
+primitive cannot even fail: once the input has, it reads as zeros, the error is
+kept on the side, and the few loops that zeros would not stop, or that would
+output something, check for it. And nothing large is ever returned by value,
+which would drag `memcpy` in.
 
 What is left out: compression, preset dictionaries (`Error::Unsupported`),
 exposing the gzip header fields, and verifying the optional gzip header CRC,
