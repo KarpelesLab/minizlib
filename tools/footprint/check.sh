@@ -32,15 +32,17 @@ check() {
     fi
 }
 
-echo '| gzip configuration                             | code  | RAM  | panics |'
+echo '| configuration                                  | code  | RAM  | panics |'
 echo '|------------------------------------------------|------:|-----:|-------:|'
-check 'buffer out, default features' buffer 'gzip checksum concat stored fixed dynamic'
-check '- with crc-table' buffer 'gzip checksum crc-table concat stored fixed dynamic'
-check '- without concat' buffer 'gzip checksum stored fixed dynamic'
-check '- without concat and checksum' buffer 'gzip stored fixed dynamic'
-check 'buffer out, dynamic blocks only' buffer 'gzip dynamic'
-check 'buffer out, fixed blocks only' buffer 'gzip fixed'
-check 'buffer out, stored blocks only' buffer 'gzip stored'
-check 'stream in / stream out, default features' stream 'gzip checksum concat stored fixed dynamic'
-check 'length only, default features' len 'gzip checksum concat stored fixed dynamic'
+check 'gunzip: buffer out, default features' buffer 'decompress gzip checksum concat stored fixed dynamic'
+check '- with crc-table' buffer 'decompress gzip checksum crc-table concat stored fixed dynamic'
+check '- without concat' buffer 'decompress gzip checksum stored fixed dynamic'
+check '- without concat and checksum' buffer 'decompress gzip stored fixed dynamic'
+check 'gunzip: buffer out, dynamic blocks only' buffer 'decompress gzip dynamic'
+check 'gunzip: buffer out, fixed blocks only' buffer 'decompress gzip fixed'
+check 'gunzip: buffer out, stored blocks only' buffer 'decompress gzip stored'
+check 'gunzip: stream in / stream out' stream 'decompress gzip checksum concat stored fixed dynamic'
+check 'gunzip: length only' len 'decompress gzip checksum concat stored fixed dynamic'
+check 'gzip: buffer in, buffer out' compress 'compress gzip'
+check 'gzip: stream in, stream out' compress-stream 'compress gzip'
 exit $status

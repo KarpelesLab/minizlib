@@ -1,355 +1,322 @@
-//! The deflate decoder (RFC 1951).
+//! The deflate encoder.
 //!
-//! Huffman codes are decoded canonically, one bit at a time, from a count of
-//! codes per length and a list of symbols sorted by code, in the manner of
-//! zlib's `puff`. This is slower than table lookups but needs very little
-//! code and only about 1.5 KiB of stack.
+//! Greedy LZ77 over a single-probe hash table, coded with the fixed Huffman
+//! codes: no code to build, nothing to buffer, a single pass. The table is the
+//! caller's, and holds the low sixteen bits of the last position at which each
+//! hash was seen. That is enough to tell a distance within deflate's 32 KiB
+//! reach; what it cannot tell, such as a stale or never written entry, is
+//! caught by comparing the data, which has to be done anyway.
 
-use crate::{Checksum, Error, Input, Output};
+#[cfg(any(feature = "gzip", feature = "zlib"))]
+use crate::Checksum;
+#[cfg(feature = "zlib")]
+use crate::checksum::Adler32;
+#[cfg(feature = "gzip")]
+use crate::checksum::Crc32;
+use crate::{Error, Output};
 
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_BITS: usize = 15;
-/// Most literal/length symbols a block can define.
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_LEN_SYMS: usize = 288;
-/// Most distance symbols a block can define.
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_DIST_SYMS: usize = 32;
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_SYMS: usize = MAX_LEN_SYMS + MAX_DIST_SYMS;
+const MIN_MATCH: usize = 3;
+const MAX_MATCH: usize = 258;
+const MAX_DIST: usize = 32768;
+/// A match of the minimum length costs more than literals from this far.
+const TOO_FAR: usize = 4096;
 
-/// The decoder: a bit reader over the input, which the containers also read
-/// their headers and trailers through, the output and its checksum.
-pub(crate) struct Inflate<'a, I, O, C> {
-    input: &'a mut I,
-    pub(crate) out: &'a mut O,
-    pub(crate) check: C,
+const END_OF_BLOCK: u32 = 256;
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// A container for compressed data: [`Gzip`](struct.Gzip.html),
+/// [`Zlib`](struct.Zlib.html) or [`Raw`].
+pub trait Format: sealed::Sealed {
+    #[doc(hidden)]
+    const HEADER: &'static [u8];
+    /// How many of the `trailer` words to write.
+    #[doc(hidden)]
+    const TRAILER: usize;
+    #[doc(hidden)]
+    fn new() -> Self;
+    #[doc(hidden)]
+    fn update(&mut self, data: &[u8]);
+    /// The trailer, as little-endian words, given the length of the data
+    /// modulo 2<sup>32</sup>.
+    #[doc(hidden)]
+    fn trailer(&self, size: u32) -> [u32; 2];
+}
+
+/// The gzip format (RFC 1952), as produced by `gzip`.
+#[cfg(feature = "gzip")]
+pub struct Gzip(Crc32);
+
+#[cfg(feature = "gzip")]
+impl sealed::Sealed for Gzip {}
+
+#[cfg(feature = "gzip")]
+impl Format for Gzip {
+    // Deflate, no flags, no modification time, no extra flags, unknown OS.
+    const HEADER: &'static [u8] = &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
+    const TRAILER: usize = 2;
+
+    fn new() -> Self {
+        Gzip(Crc32::new())
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    fn trailer(&self, size: u32) -> [u32; 2] {
+        [self.0.value(), size]
+    }
+}
+
+/// The zlib format (RFC 1950).
+#[cfg(feature = "zlib")]
+pub struct Zlib(Adler32);
+
+#[cfg(feature = "zlib")]
+impl sealed::Sealed for Zlib {}
+
+#[cfg(feature = "zlib")]
+impl Format for Zlib {
+    // Deflate with a 32 KiB window, fastest algorithm, no dictionary.
+    const HEADER: &'static [u8] = &[0x78, 0x01];
+    const TRAILER: usize = 1;
+
+    fn new() -> Self {
+        Zlib(Adler32::new())
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    fn trailer(&self, _: u32) -> [u32; 2] {
+        // Big-endian.
+        [self.0.value().swap_bytes(), 0]
+    }
+}
+
+/// A raw deflate stream (RFC 1951): no header, no checksum.
+pub struct Raw;
+
+impl sealed::Sealed for Raw {}
+
+impl Format for Raw {
+    const HEADER: &'static [u8] = &[];
+    const TRAILER: usize = 0;
+
+    fn new() -> Self {
+        Raw
+    }
+
+    fn update(&mut self, _: &[u8]) {}
+
+    fn trailer(&self, _: u32) -> [u32; 2] {
+        [0; 2]
+    }
+}
+
+/// The base two logarithm of `value`, rounded down. Unlike `ilog2`, it has no
+/// panic to link for a zero it is never given.
+fn log2(value: u32) -> u32 {
+    31 - value.leading_zeros()
+}
+
+/// Stream in: compresses data as it comes, a chunk at a time, in format `F`.
+/// The one-shot functions, such as [`gzip`](fn.gzip.html), are this with a
+/// single chunk.
+///
+/// The compressed data goes to any [`Output`]: a [`Buffer`](crate::Buffer), a
+/// [`Stream`](crate::Stream), whose window then is a mere buffer, of any size,
+/// or a [`Counter`](crate::Counter) to only find out how long it would be.
+///
+/// `table` is the memory matches get found with. Any number of entries will
+/// do, of which the largest power of two, up to 65536, gets used; it need not
+/// be cleared. The more the better, to a point: 4096 entries (8 KiB) is a good
+/// deal, and an empty table still gets the Huffman coding done.
+///
+/// Matches are only looked for within a chunk, so larger chunks compress
+/// better, until they reach a few times deflate's 32 KiB reach. Each chunk
+/// also costs ten bits.
+pub struct Compressor<'t, O, F> {
+    out: O,
+    format: F,
+    /// What is left to write of the header.
+    header: &'static [u8],
+    table: &'t mut [u16],
+    mask: usize,
+    start: u64,
+    size: u32,
     bit_buf: u32,
     bit_cnt: u32,
-    /// The first failure of the input. From then on it reads as zeros, which
-    /// spares an error path at every read; see `bits`.
-    status: Result<(), Error>,
 }
 
-/// A canonical Huffman code: `count[n]` codes of `n` bits each, and the
-/// symbols they decode to, ordered by code.
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-struct Huffman<'a> {
-    count: [u16; MAX_BITS + 1],
-    symbol: &'a mut [u16],
-    /// The number of unused codes: zero for a complete code, negative for an
-    /// over-subscribed one.
-    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
-    left: i32,
-}
-
-#[cfg(any(feature = "fixed", feature = "dynamic"))]
-impl<'a> Huffman<'a> {
-    /// An empty code, to `build` in place: returning a built one by value
-    /// would copy it, and drag `memcpy` in.
-    fn new(symbol: &'a mut [u16]) -> Self {
-        Huffman {
-            count: [0; MAX_BITS + 1],
-            symbol,
-            left: 1,
-        }
-    }
-
-    /// Builds an empty code from the code length of each symbol.
-    fn build(&mut self, lengths: &[u8]) {
-        let count = &mut self.count;
-        for &len in lengths {
-            count[(len & 15) as usize] += 1;
-        }
-
-        let mut left = 1;
-        let mut offsets = [0u16; MAX_BITS + 1];
-        for len in 1..=MAX_BITS {
-            left = (left << 1) - count[len] as i32;
-            if len < MAX_BITS {
-                offsets[len + 1] = offsets[len] + count[len];
-            }
-        }
-
-        // An over-subscribed code gets rejected before it is used; its symbols
-        // that do not fit are dropped here.
-        for (sym, &len) in lengths.iter().enumerate() {
-            if len != 0 {
-                let offset = &mut offsets[(len & 15) as usize];
-                if let Some(slot) = self.symbol.get_mut(*offset as usize) {
-                    *slot = sym as u16;
-                }
-                *offset += 1;
-            }
-        }
-        self.left = left;
-    }
-
-    /// Whether the code is one deflate permits for literals/lengths and for
-    /// distances: complete, or made of a single one-bit code.
-    #[cfg(feature = "dynamic")]
-    fn is_valid(&self, symbols: usize) -> bool {
-        self.left == 0 || (self.left > 0 && symbols == (self.count[0] + self.count[1]) as usize)
-    }
-}
-
-impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
-    pub(crate) fn new(input: &'a mut I, out: &'a mut O, check: C) -> Self {
-        Inflate {
-            input,
-            out,
-            check,
+impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
+    /// Starts a compressed stream.
+    ///
+    /// Nothing is written yet, and the compressor is built in place: handing
+    /// it over inside a `Result` would have it copied, and drag `memcpy` in.
+    #[inline(always)]
+    pub fn new(output: O, table: &'t mut [u16]) -> Self {
+        let mask = match table.len().checked_ilog2() {
+            Some(bits) => (1 << bits.min(16)) - 1,
+            None => 0,
+        };
+        Compressor {
+            start: output.written(),
+            out: output,
+            format: F::new(),
+            header: F::HEADER,
+            table,
+            mask,
+            size: 0,
             bit_buf: 0,
             bit_cnt: 0,
-            status: Ok(()),
         }
     }
 
-    /// Runs `decode`, then reports the failure of the input if there was one,
-    /// rather than whatever was made of the zeros read past it.
-    pub(crate) fn run(
-        &mut self,
-        decode: impl FnOnce(&mut Self) -> Result<(), Error>,
-    ) -> Result<(), Error> {
-        let result = decode(self);
-        self.status.and(result)
-    }
+    /// Compresses a chunk of data, as one deflate block.
+    pub fn write(&mut self, data: &[u8]) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.format.update(data);
+        self.size = self.size.wrapping_add(data.len() as u32);
 
-    /// Reads `need` bits, at most 16, least significant first.
-    ///
-    /// This cannot fail: once the input has, it is not asked again, `status`
-    /// holds its error, and zeros are read. Callers only have to make sure
-    /// that zeros get them to `run`'s verdict, without looping forever and
-    /// without producing any output on the way. Zeros end every header field
-    /// and make for an invalid stored block; the loops that could go on, or
-    /// output something, check `status`.
-    pub(crate) fn bits(&mut self, need: u32) -> u16 {
-        while self.bit_cnt < need {
-            if self.status.is_ok() {
-                match self.input.byte() {
-                    Ok(byte) => self.bit_buf |= (byte as u32) << self.bit_cnt,
-                    Err(error) => self.status = Err(error),
-                }
-            }
-            self.bit_cnt += 8;
-        }
-        let value = self.bit_buf & ((1 << need) - 1);
-        self.bit_buf >>= need;
-        self.bit_cnt -= need;
-        value as u16
-    }
-
-    /// Skips `bytes` bytes. Only valid on a byte boundary.
-    #[cfg(feature = "gzip")]
-    pub(crate) fn skip(&mut self, bytes: u16) {
-        for _ in 0..bytes {
-            self.bits(8);
-        }
-    }
-
-    /// Decodes one raw deflate stream and flushes the output. Leaves the input
-    /// right after the stream, on a byte boundary.
-    pub(crate) fn inflate(&mut self) -> Result<(), Error> {
-        loop {
-            let last = self.bits(1) != 0;
-            match self.bits(2) {
-                #[cfg(feature = "stored")]
-                0 => self.stored()?,
-                #[cfg(feature = "fixed")]
-                1 => self.fixed()?,
-                #[cfg(feature = "dynamic")]
-                2 => self.dynamic()?,
-                3 => return Err(Error::InvalidBlock),
-                _ => return Err(Error::Unsupported),
-            }
-            if last {
-                break;
-            }
-        }
-        // Input is only ever fetched a byte at a time, so the bits left over
-        // are padding and nothing past the end of the stream was consumed.
-        self.bit_cnt = 0;
-        self.bit_buf = 0;
-        self.out.flush(&mut self.check)
-    }
-
-    #[cfg(feature = "stored")]
-    fn stored(&mut self) -> Result<(), Error> {
-        // Skip to the next byte boundary.
-        self.bit_buf = 0;
-        self.bit_cnt = 0;
-        let len = self.bits(16);
-        if self.bits(16) != !len {
-            return Err(Error::InvalidBlock);
-        }
-        for _ in 0..len {
-            let byte = self.bits(8) as u8;
-            self.status?;
-            self.out.put(byte, &mut self.check)?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "fixed")]
-    fn fixed(&mut self) -> Result<(), Error> {
-        // Code lengths, by runs of symbols: the literals/lengths, then all 32
-        // five-bit distance codes, to make that code complete. The last two
-        // are rejected when they come up.
-        const RUNS: [(u8, u8); 5] = [(144, 8), (112, 9), (24, 7), (8, 8), (32, 5)];
-        let mut lengths = [0u8; MAX_SYMS];
-        let mut rest = &mut lengths[..];
-        for (count, len) in RUNS {
-            let Some((run, tail)) = rest.split_at_mut_checked(count as usize) else {
-                break;
-            };
-            run.fill(len);
-            rest = tail;
-        }
-        self.compressed(&lengths, MAX_LEN_SYMS).map(drop)
-    }
-
-    #[cfg(feature = "dynamic")]
-    fn dynamic(&mut self) -> Result<(), Error> {
-        /// Order in which the code length code lengths are stored.
-        const ORDER: [u8; 19] = [
-            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-        ];
-
-        let len_syms = self.bits(5) as usize + 257;
-        let dist_syms = self.bits(5) as usize + 1;
-        let code_syms = self.bits(4) as usize + 4;
-        if len_syms > 286 || dist_syms > 30 {
-            return Err(Error::InvalidBlock);
-        }
-
-        let mut lengths = [0u8; MAX_SYMS];
-        for &sym in ORDER.iter().take(code_syms) {
-            lengths[(sym & 31) as usize] = self.bits(3) as u8;
-        }
-        let mut symbol = [0; 19];
-        let mut code = Huffman::new(&mut symbol);
-        code.build(&lengths[..19]);
-        if code.left != 0 {
-            return Err(Error::InvalidCode);
-        }
-
-        // Literal/length code lengths, directly followed by the distance ones.
-        let lengths = lengths
-            .get_mut(..len_syms + dist_syms)
-            .ok_or(Error::InvalidBlock)?;
-        let mut index = 0;
-        while index < lengths.len() {
-            let sym = self.decode(&code)?;
-            let (len, repeat) = match sym {
-                0..=15 => (sym as u8, 1),
-                16 => {
-                    let prev = *lengths
-                        .get(index.wrapping_sub(1))
-                        .ok_or(Error::InvalidCode)?;
-                    (prev, 3 + self.bits(2))
-                }
-                17 => (0, 3 + self.bits(3)),
-                _ => (0, 11 + self.bits(7)),
-            };
-            let end = index + repeat as usize;
-            lengths
-                .get_mut(index..end)
-                .ok_or(Error::InvalidCode)?
-                .fill(len);
-            index = end;
-        }
-
-        // A block without an end-of-block code could never finish.
-        if lengths.get(256) == Some(&0) {
-            return Err(Error::InvalidCode);
-        }
-        match self.compressed(lengths, len_syms)? {
-            true => Ok(()),
-            false => Err(Error::InvalidCode),
-        }
-    }
-
-    /// Decodes a compressed block given the code length of each literal/length
-    /// symbol, directly followed by those of the distance symbols. Returns
-    /// whether both codes were ones deflate permits.
-    #[cfg(any(feature = "fixed", feature = "dynamic"))]
-    fn compressed(&mut self, lengths: &[u8], len_syms: usize) -> Result<bool, Error> {
-        let (len_lengths, dist_lengths) = lengths
-            .split_at_checked(len_syms)
-            .ok_or(Error::InvalidBlock)?;
-        let mut symbol = [0; MAX_SYMS];
-        let (len_symbol, dist_symbol) = symbol.split_at_mut(MAX_LEN_SYMS);
-        let mut len_code = Huffman::new(len_symbol);
-        let mut dist_code = Huffman::new(dist_symbol);
-        len_code.build(len_lengths);
-        dist_code.build(dist_lengths);
-        #[cfg(feature = "dynamic")]
-        if !len_code.is_valid(len_lengths.len()) || !dist_code.is_valid(dist_lengths.len()) {
-            return Ok(false);
-        }
-
-        loop {
-            let sym = self.decode(&len_code)? as u32;
-            if sym < 256 {
-                self.out.put(sym as u8, &mut self.check)?;
+        // Not the final block, fixed Huffman codes.
+        self.block(0b010)?;
+        let mut pos = 0;
+        while let Some(&byte) = data.get(pos) {
+            let (len, dist) = self.find(data, pos);
+            if len < MIN_MATCH {
+                self.symbol(byte as u32)?;
+                pos += 1;
                 continue;
             }
-            if sym == 256 {
-                return Ok(true);
-            }
+            pos += len;
 
-            // Lengths 3..=258 from symbols 257..=285: four symbols for each
-            // count of extra bits, except at both ends.
-            let sym = sym - 257;
-            let len = match sym {
-                0..=3 => sym + 3,
-                4..=27 => {
-                    let extra = (sym - 4) >> 2;
-                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra) as u32
+            // The inverse of the decoder's arithmetic. Length symbols come by
+            // four for each count of extra bits, distance ones by two.
+            let len = (len - MIN_MATCH) as u32;
+            let (sym, extra) = match len {
+                0..=7 => (len, 0),
+                255 => (28, 0),
+                _ => {
+                    let extra = log2(len) - 2;
+                    (4 * extra + 4 + ((len >> extra) & 3), extra)
                 }
-                28 => 258,
-                _ => return Err(Error::InvalidCode),
             };
+            self.symbol(257 + sym)?;
+            self.bits(len & ((1 << extra) - 1), extra)?;
 
-            // Distances 1..=32768 from symbols 0..=29, two symbols for each
-            // count of extra bits.
-            let sym = self.decode(&dist_code)? as u32;
-            let dist = match sym {
-                0..=1 => sym + 1,
-                2..=29 => {
-                    let extra = (sym - 2) >> 1;
-                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra) as u32
+            let dist = (dist - 1) as u32;
+            let (sym, extra) = match dist {
+                0..=3 => (dist, 0),
+                _ => {
+                    let extra = log2(dist) - 1;
+                    (2 * extra + 2 + ((dist >> extra) & 1), extra)
                 }
-                _ => return Err(Error::InvalidCode),
             };
-
-            self.status?;
-            self.out
-                .copy(dist as usize, len as usize, &mut self.check)?;
+            // Distance codes are five bits long, the most significant first.
+            self.bits(sym.reverse_bits() >> 27, 5)?;
+            self.bits(dist & ((1 << extra) - 1), extra)?;
         }
+        self.symbol(END_OF_BLOCK)
     }
 
-    #[cfg(any(feature = "fixed", feature = "dynamic"))]
-    fn decode(&mut self, code: &Huffman) -> Result<u16, Error> {
-        let mut bits = 0i32;
-        let mut first = 0i32;
-        let mut index = 0i32;
-        for &count in &code.count[1..] {
-            let count = count as i32;
-            bits |= self.bits(1) as i32;
-            if bits - count < first {
-                // Checked here for the sake of the callers' loops.
-                self.status?;
-                return code
-                    .symbol
-                    .get((index + bits - first) as usize)
-                    .copied()
-                    .ok_or(Error::InvalidCode);
-            }
-            index += count;
-            first = (first + count) << 1;
-            bits <<= 1;
+    /// Ends the stream, writing its trailer and flushing the output. Returns
+    /// the length of the compressed stream.
+    ///
+    /// The compressor is then ready for another stream, to the same output.
+    /// This takes no `self`: that would be a copy, and drag `memcpy` in.
+    pub fn finish(&mut self) -> Result<u64, Error> {
+        // A final, empty block, then padding to a byte boundary.
+        self.block(0b011)?;
+        self.symbol(END_OF_BLOCK)?;
+        self.bits(0, 7)?;
+        self.bit_cnt = 0;
+
+        let trailer = self.format.trailer(self.size);
+        for &word in trailer.iter().take(F::TRAILER) {
+            self.bits(word & 0xffff, 16)?;
+            self.bits(word >> 16, 16)?;
         }
-        Err(Error::InvalidCode)
+        self.out.flush(&mut ())?;
+
+        let end = self.out.written();
+        let len = end - self.start;
+        self.start = end;
+        self.format = F::new();
+        self.header = F::HEADER;
+        self.size = 0;
+        Ok(len)
+    }
+
+    /// Starts a block, after the header if this is the first.
+    fn block(&mut self, kind: u32) -> Result<(), Error> {
+        for &byte in core::mem::take(&mut self.header) {
+            self.bits(byte as u32, 8)?;
+        }
+        self.bits(kind, 3)
+    }
+
+    /// Looks for a match for the data at `pos`. Returns its length, zero if
+    /// there is none, and distance.
+    fn find(&mut self, data: &[u8], pos: usize) -> (usize, usize) {
+        let ahead = data.get(pos..).unwrap_or(&[]);
+        let Some(&[a, b, c]) = ahead.first_chunk() else {
+            return (0, 0);
+        };
+        let hash = u32::from_le_bytes([a, b, c, 0]).wrapping_mul(0x9e37_79b1) >> 16;
+        let Some(entry) = self.table.get_mut(hash as usize & self.mask) else {
+            return (0, 0);
+        };
+        let dist = (pos as u16).wrapping_sub(*entry) as usize;
+        *entry = pos as u16;
+
+        // A distance of zero is 65536 bytes back, or an entry never written.
+        let Some(behind) = pos.checked_sub(dist).and_then(|from| data.get(from..)) else {
+            return (0, 0);
+        };
+        if dist == 0 || dist > MAX_DIST {
+            return (0, 0);
+        }
+        let len = behind
+            .iter()
+            .zip(ahead)
+            .take(MAX_MATCH)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if len == MIN_MATCH && dist > TOO_FAR {
+            return (0, 0);
+        }
+        (len, dist)
+    }
+
+    /// Writes a literal/length symbol with its fixed Huffman code.
+    fn symbol(&mut self, sym: u32) -> Result<(), Error> {
+        let (code, len) = match sym {
+            0..=143 => (0x30 + sym, 8),
+            144..=255 => (sym - 144 + 0x190, 9),
+            256..=279 => (sym - 256, 7),
+            _ => (sym - 280 + 0xc0, 8),
+        };
+        // Huffman codes go the most significant bit first.
+        self.bits(code.reverse_bits() >> (32 - len), len)
+    }
+
+    /// Writes the `count` low bits of `value`, at most 16, the least
+    /// significant first. The others must be zeros.
+    fn bits(&mut self, value: u32, count: u32) -> Result<(), Error> {
+        self.bit_buf |= value << self.bit_cnt;
+        self.bit_cnt += count;
+        while self.bit_cnt >= 8 {
+            self.out.put(self.bit_buf as u8, &mut ())?;
+            self.bit_buf >>= 8;
+            self.bit_cnt -= 8;
+        }
+        Ok(())
     }
 }

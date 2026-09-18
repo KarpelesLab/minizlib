@@ -10,6 +10,8 @@ publish = false
 buffer = []
 stream = []
 len = []
+compress = []
+compress-stream = []
 
 [dependencies]
 minizlib = { path = "../..", default-features = false }

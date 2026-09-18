@@ -8,7 +8,7 @@
 use crate::checksum::Adler32;
 #[cfg(all(feature = "gzip", feature = "checksum"))]
 use crate::checksum::Crc32;
-use crate::deflate::Inflate;
+use crate::inflate::Inflate;
 use crate::{Error, Input, Output};
 
 /// Decodes a gzip stream whose first byte, `first`, was already read.

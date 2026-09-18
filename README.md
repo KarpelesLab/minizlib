@@ -1,35 +1,45 @@
 # minizlib
 
-A tiny gzip / zlib / deflate decompressor for Rust: `no_std`, no allocation,
-no `unsafe`, no dependencies, no panics, and as little code as possible.
+A tiny gzip / zlib / deflate compressor and decompressor for Rust: `no_std`, no
+allocation, no `unsafe`, no dependencies, no panics, and as little code as
+possible.
 
-Full gzip support links to **under 2.5 KB** of Thumb-2 code, and features let
-you strip that down further. Buffer in or stream in, buffer out or stream out,
-and go.
+Full gzip decompression links to **under 2.5 KB** of Thumb-2 code, compression
+to **about 1 KB**, and features let you strip that down further. Buffer in or
+stream in, buffer out or stream out, and go.
 
 ```rust
-use minizlib::{gunzip, Buffer};
+use minizlib::{gunzip, gzip, Buffer};
 
 let mut out = [0; 4096];
 let len = gunzip(gz_bytes, Buffer::new(&mut out))? as usize;
 let data = &out[..len];
+
+let mut table = [0; 4096]; // to find matches with
+let mut gz = [0; 4096];
+let len = gzip(data, &mut table, Buffer::new(&mut gz))? as usize;
 ```
 
 ## Pick a format, an input and an output
 
-| format                 | function     | length only      |
-|------------------------|--------------|------------------|
-| gzip (RFC 1952)        | `gunzip`     | `gunzip_len`     |
-| zlib (RFC 1950)        | `unzlib`     | `unzlib_len`     |
-| raw deflate (RFC 1951) | `inflate`    | `inflate_len`    |
-| gzip or zlib, detected | `decompress` | `decompress_len` |
+| format                 | decompress   | length only      | compress  |
+|------------------------|--------------|------------------|-----------|
+| gzip (RFC 1952)        | `gunzip`     | `gunzip_len`     | `gzip`    |
+| zlib (RFC 1950)        | `unzlib`     | `unzlib_len`     | `zlib`    |
+| raw deflate (RFC 1951) | `inflate`    | `inflate_len`    | `deflate` |
+| gzip or zlib, detected | `decompress` | `decompress_len` |           |
 
-| input                | how                      |
+| input to decompress  | how                      |
 |----------------------|--------------------------|
 | buffer in            | `&[u8]`, or `&mut &[u8]` to get the unconsumed rest back |
 | stream in (callback) | `Reader::new(&mut scratch, \|buf\| ...)`, scratch of any size |
 | stream in (iterator) | `Bytes(iter)`            |
 | anything else        | implement `Input`, a single `fn byte()` |
+
+| input to compress    | how                      |
+|----------------------|--------------------------|
+| buffer in            | `&[u8]`                  |
+| stream in            | `Compressor`, a chunk at a time |
 
 | output                | how                                  | memory needed            |
 |-----------------------|--------------------------------------|--------------------------|
@@ -39,7 +49,8 @@ let data = &out[..len];
 
 Every function takes any input with any output, and returns the number of
 bytes produced. Pass `&mut input` or `&mut output` to keep using them
-afterwards. Beyond the above, decoding uses about 1.5 KiB of stack.
+afterwards. Beyond the above, decompressing uses about 1.5 KiB of stack, and
+compressing next to none.
 
 Every path is bounded, so a decompression bomb cannot run away: a `Buffer` by
 its size, a `Stream`, a `Counter` and the `*_len` functions by a mandatory
@@ -69,6 +80,50 @@ compressor (`wbits` in zlib), a smaller window works with a smaller buffer.
 The decoder never reads past the end of the compressed stream, apart from the
 one look-ahead byte the `concat` feature needs.
 
+### Compressing
+
+```rust
+use minizlib::{Compressor, Gzip, Stream, NO_LIMIT};
+
+let mut table = [0; 4096];
+let mut buffer = [0; 64];
+let output = Stream::new(&mut buffer, NO_LIMIT, |data| uart.write(data).map_err(|_| Error::Io));
+
+let mut compressor = Compressor::<_, Gzip>::new(output, &mut table);
+while let Some(chunk) = sensor.next_chunk() {
+    compressor.write(chunk)?;
+}
+let compressed_len = compressor.finish()?;
+```
+
+The compressor is greedy LZ77 over a single-probe hash table, coded with
+deflate's fixed Huffman codes: one pass, nothing to buffer, no code to build.
+The outputs are the decompressor's: a `Buffer`, a `Stream` (whose window is
+then a mere buffer, of any size), or a `Counter` to only learn the compressed
+length. `gzip`, `zlib` and `deflate` are a `Compressor` given a single chunk.
+
+The table is yours: any number of `u16`, of which the largest power of two gets
+used. It need not be cleared, as what it holds is checked against the data. An
+empty one still gets the Huffman coding done. On 8.7 MB of source code:
+
+| table                     | compressed |
+|---------------------------|-----------:|
+| none                      |      89 %  |
+| 256 entries (512 B)       |      41 %  |
+| 1024 entries (2 KiB)      |      34 %  |
+| 4096 entries (8 KiB)      |      32 %  |
+| 65536 entries (128 KiB)   |      31 %  |
+| `gzip -1`, for comparison |      24 %  |
+| `gzip -6`                 |      19 %  |
+
+Matches are only looked for within a chunk, so larger chunks compress better
+(34 % with chunks of 32 KiB, 42 % with 4 KiB, same table of 4096), and each
+chunk costs ten bits. What cannot be compressed grows by an eighth at worst.
+
+The price of the small code is the ratio: fixed Huffman codes and no lazy
+matching. Entering the positions that a match skips into the table would gain
+4 % for 100 bytes of code and a third more time; it was left out.
+
 ### Finding the decompressed length
 
 `gunzip_len(input, max_len)` and friends decode the stream without storing
@@ -87,29 +142,34 @@ unverified.
 Everything is on by default except `crc-table`. To strip what you don't need:
 
 ```toml
-minizlib = { version = "0.1", default-features = false, features = ["gzip", "dynamic"] }
+minizlib = { version = "0.1", default-features = false, features = ["decompress", "gzip", "dynamic"] }
 ```
 
-| feature     | what it does |
-|-------------|--------------|
-| `gzip`      | the gzip container |
-| `zlib`      | the zlib container |
-| `checksum`  | verify CRC-32 and length (gzip) or Adler-32 (zlib); otherwise trailers are read and ignored |
-| `crc-table` | 256-entry CRC-32 table (1 KiB) instead of the 16-entry one (64 B): faster, bigger |
-| `concat`    | decode concatenated gzip members as one stream, like `gzip -d`; consumes one byte past each member, if any, to look for the next |
-| `stored`    | deflate stored blocks |
-| `fixed`     | deflate fixed Huffman blocks |
-| `dynamic`   | deflate dynamic Huffman blocks |
+| feature      | what it does |
+|--------------|--------------|
+| `decompress` | the decompressor |
+| `compress`   | the compressor |
+| `gzip`       | the gzip container |
+| `zlib`       | the zlib container |
+| `checksum`   | when decompressing, verify CRC-32 and length (gzip) or Adler-32 (zlib); otherwise trailers are read and ignored |
+| `crc-table`  | 256-entry CRC-32 table (1 KiB) instead of the 16-entry one (64 B): faster, bigger |
+| `concat`     | decompress concatenated gzip members as one stream, like `gzip -d`; consumes one byte past each member, if any, to look for the next |
+| `stored`     | decompress deflate stored blocks |
+| `fixed`      | decompress deflate fixed Huffman blocks |
+| `dynamic`    | decompress deflate dynamic Huffman blocks |
 
-Raw deflate is always available. At least one block type must be enabled;
-streams using a disabled one fail with `Error::Unsupported`. General purpose
-compressors emit all three, so only drop block types if you control the
-compressor.
+Raw deflate is always available. To decompress, at least one block type must
+be enabled; streams using a disabled one fail with `Error::Unsupported`.
+General purpose compressors emit all three, so only drop block types if you
+control the compressor. This crate's own only emits `fixed`.
+
+What you do not call does not get linked, features or not: they are there to
+make sure of it, and to save on build time.
 
 ## Size
 
-Code size of a function gunzipping one slice into another, everything it needs
-included, on `thumbv7em-none-eabi` with `opt-level = "z"` and LTO (rustc 1.98).
+Code size of a function gunzipping, or gzipping, one slice into another,
+everything it needs included, on `thumbv7em-none-eabi` with `opt-level = "z"` and LTO (rustc 1.98).
 No RAM is used besides the stack. `tools/footprint/check.sh` reproduces the
 table, and CI runs it to keep the no-panic guarantee honest.
 
@@ -124,9 +184,12 @@ table, and CI runs it to keep the no-panic guarantee honest.
 | gzip, `stored` blocks only                      |   506 |
 | stream in / stream out, default features        |  2752 |
 | length only, default features                   |  2267 |
+| **compression**: gzip, buffer in, buffer out    |  1028 |
+| **compression**: gzip, stream in, stream out    |  1348 |
 
-About 400 of those bytes are the `memset` / `memclr` routines of
-`compiler_builtins`, which most firmware links anyway. No configuration links
+About 400 of the decompressor's bytes are the `memset` / `memclr` routines of
+`compiler_builtins`, which most firmware links anyway; the compressor needs
+none. No configuration links
 any panic machinery: malformed input of any kind is reported as an `Error`.
 
 ## How
@@ -148,7 +211,7 @@ kept on the side, and the few loops that zeros would not stop, or that would
 output something, check for it. And nothing large is ever returned by value,
 which would drag `memcpy` in.
 
-What is left out: compression, preset dictionaries (`Error::Unsupported`),
+What is left out: dynamic Huffman codes when compressing, preset dictionaries (`Error::Unsupported`),
 exposing the gzip header fields, and verifying the optional gzip header CRC,
 which gzip itself never writes.
 
@@ -158,7 +221,11 @@ which gzip itself never writes.
 compression level and every input / output combination, checks error
 reporting, truncates streams at every offset, and feeds the decoder tens of
 thousands of corrupted and random streams, checking all outputs agree.
-`examples/gunzip.rs` is a streaming `gzip -dc` lookalike to try on real files.
+The compressor's output is checked against both this crate's decompressor and
+flate2's, over data stitched from copies of every length and distance, tables
+of every size, cleared or not, and chunks of every size. `examples/gunzip.rs`
+and `examples/gzip.rs` are streaming lookalikes of `gzip -dc` and `gzip -c` to
+try on real files.
 
 ## License
 

@@ -45,3 +45,48 @@ pub extern "C" fn entry(src: *const u8, src_len: usize, max_len: u64) -> i64 {
     let src = unsafe { core::slice::from_raw_parts(src, src_len) };
     gunzip_len(src, max_len).map_or(-1, |len| len as i64)
 }
+
+/// Compression: buffer in, buffer out.
+#[cfg(feature = "compress")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    src: *const u8,
+    src_len: usize,
+    dst: *mut u8,
+    dst_len: usize,
+    table: *mut u16,
+    table_len: usize,
+) -> i64 {
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+    let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+    gzip(src, table, Buffer::new(dst)).map_or(-1, |len| len as i64)
+}
+
+/// Compression: stream in, stream out.
+#[cfg(feature = "compress-stream")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    write: extern "C" fn(*const u8, usize),
+    table: *mut u16,
+    table_len: usize,
+) -> i64 {
+    let table = unsafe { core::slice::from_raw_parts_mut(table, table_len) };
+    let mut chunk = [0; 512];
+    let mut buffer = [0; 64];
+    let output = Stream::new(&mut buffer, NO_LIMIT, |data| {
+        write(data.as_ptr(), data.len());
+        Ok(())
+    });
+    let mut compressor = Compressor::<_, Gzip>::new(output, table);
+    loop {
+        let len = read(chunk.as_mut_ptr(), chunk.len()).min(chunk.len());
+        if len == 0 {
+            return compressor.finish().map_or(-1, |len| len as i64);
+        }
+        if compressor.write(&chunk[..len]).is_err() {
+            return -1;
+        }
+    }
+}

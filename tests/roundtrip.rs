@@ -1,6 +1,7 @@
 //! Round trips against flate2, over every input and output kind.
 
 #![cfg(all(
+    feature = "decompress",
     feature = "gzip",
     feature = "zlib",
     feature = "checksum",

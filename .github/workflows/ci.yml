@@ -75,8 +75,10 @@ jobs:
       - name: Build with all features
         run: cargo build --target ${{ matrix.target }} --all-features
 
-      - name: Build the bare minimum
-        run: cargo build --target ${{ matrix.target }} --no-default-features --features stored
+      - name: Build the bare minimum, each way
+        run: |
+          cargo build --target ${{ matrix.target }} --no-default-features --features decompress,stored
+          cargo build --target ${{ matrix.target }} --no-default-features --features compress
 
   footprint:
     # Guards the README's claims: builds a bare-metal binary around the crate
@@ -160,16 +162,22 @@ jobs:
         with:
           key: lean
 
-      # At least one block type is mandatory, so each set carries one. Keep in
-      # sync with Cargo.toml's [features] when adding a feature.
+      # Decompression needs at least one block type, so each of its sets
+      # carries one. Keep in sync with Cargo.toml's [features] when adding a
+      # feature.
       - name: clippy + rustdoc, one feature set at a time
         run: |
           set -euo pipefail
-          for f in stored fixed dynamic \
-                   gzip,stored zlib,stored gzip,zlib,stored \
-                   gzip,checksum,stored zlib,checksum,stored \
-                   gzip,checksum,crc-table,stored gzip,concat,stored \
-                   gzip,zlib,checksum,concat,fixed,dynamic; do
+          for f in decompress,stored decompress,fixed decompress,dynamic \
+                   decompress,gzip,stored decompress,zlib,stored \
+                   decompress,gzip,zlib,stored \
+                   decompress,gzip,checksum,stored decompress,zlib,checksum,stored \
+                   decompress,gzip,checksum,crc-table,stored \
+                   decompress,gzip,concat,stored \
+                   decompress,gzip,zlib,checksum,concat,fixed,dynamic \
+                   compress compress,gzip compress,zlib compress,gzip,zlib \
+                   compress,gzip,crc-table compress,gzip,checksum \
+                   compress,decompress,gzip,fixed compress,decompress,zlib,checksum,fixed; do
             echo "::group::$f"
             cargo clippy --no-default-features --features "$f" --all-targets -- -D warnings
             cargo doc --no-deps --no-default-features --features "$f"

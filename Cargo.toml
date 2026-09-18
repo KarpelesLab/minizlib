@@ -3,7 +3,7 @@ name = "minizlib"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Tiny no_std, no-alloc gzip / zlib / deflate decompressor"
+description = "Tiny no_std, no-alloc gzip / zlib / deflate compressor and decompressor"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/KarpelesLab/minizlib"
@@ -12,27 +12,46 @@ categories = ["compression", "no-std", "no-std::no-alloc", "embedded"]
 exclude = [".github", "tools", "release-plz.toml"]
 
 [features]
-default = ["gzip", "zlib", "checksum", "concat", "stored", "fixed", "dynamic"]
+default = [
+    "decompress",
+    "compress",
+    "gzip",
+    "zlib",
+    "checksum",
+    "concat",
+    "stored",
+    "fixed",
+    "dynamic",
+]
+
+# The two halves of the crate.
+decompress = []
+compress = []
 
 # Containers. Raw deflate is always available.
 gzip = []
 zlib = []
 
-# Verify CRC-32 / ISIZE (gzip) and Adler-32 (zlib) trailers.
+# When decompressing, verify CRC-32 / ISIZE (gzip) and Adler-32 (zlib) trailers.
 checksum = []
 # Use a 256-entry CRC-32 table (1 KiB) instead of the 16-entry one (64 B).
 crc-table = []
 # Decode concatenated gzip members (`cat a.gz b.gz`) as one stream.
 concat = []
 
-# Deflate block types. Disabled ones decode to `Error::Unsupported`.
+# Deflate block types to decompress. Disabled ones decode to
+# `Error::Unsupported`. The compressor only emits `fixed`.
 stored = []
 fixed = []
 dynamic = []
 
 [[example]]
+name = "gzip"
+required-features = ["compress", "gzip"]
+
+[[example]]
 name = "gunzip"
-required-features = ["gzip", "zlib"]
+required-features = ["decompress", "gzip", "zlib"]
 
 [dev-dependencies]
 flate2 = "1"

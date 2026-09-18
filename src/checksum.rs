@@ -15,10 +15,22 @@ impl Checksum for () {
     fn update(&mut self, _: &[u8]) {}
 }
 
-#[cfg(all(feature = "gzip", feature = "checksum"))]
+#[cfg(all(
+    feature = "gzip",
+    any(
+        feature = "compress",
+        all(feature = "decompress", feature = "checksum")
+    )
+))]
 pub(crate) use crc32::Crc32;
 
-#[cfg(all(feature = "gzip", feature = "checksum"))]
+#[cfg(all(
+    feature = "gzip",
+    any(
+        feature = "compress",
+        all(feature = "decompress", feature = "checksum")
+    )
+))]
 mod crc32 {
     const POLY: u32 = 0xedb8_8320;
 
@@ -75,13 +87,25 @@ mod crc32 {
     }
 }
 
-#[cfg(all(feature = "zlib", feature = "checksum"))]
+#[cfg(all(
+    feature = "zlib",
+    any(
+        feature = "compress",
+        all(feature = "decompress", feature = "checksum")
+    )
+))]
 pub(crate) struct Adler32 {
     a: u32,
     b: u32,
 }
 
-#[cfg(all(feature = "zlib", feature = "checksum"))]
+#[cfg(all(
+    feature = "zlib",
+    any(
+        feature = "compress",
+        all(feature = "decompress", feature = "checksum")
+    )
+))]
 impl Adler32 {
     pub(crate) fn new() -> Self {
         Adler32 { a: 1, b: 0 }
@@ -92,7 +116,13 @@ impl Adler32 {
     }
 }
 
-#[cfg(all(feature = "zlib", feature = "checksum"))]
+#[cfg(all(
+    feature = "zlib",
+    any(
+        feature = "compress",
+        all(feature = "decompress", feature = "checksum")
+    )
+))]
 impl Checksum for Adler32 {
     fn update(&mut self, data: &[u8]) {
         // 5552 is the most bytes that can be summed before `b` overflows.
