@@ -19,7 +19,7 @@ check() {
     label=$1 entry=$2 features=$3
     list=$entry
     for feature in $features; do
-        list="$list,minigunzip/$feature"
+        list="$list,minizlib/$feature"
     done
     cargo build --quiet --release --target $TARGET --features "$list"
 

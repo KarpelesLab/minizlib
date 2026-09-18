@@ -14,7 +14,7 @@ use std::io::Write;
 
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use flate2::{Compression, GzBuilder};
-use minigunzip::*;
+use minizlib::*;
 
 /// A small deterministic generator, so that failures reproduce.
 struct Rng(u64);

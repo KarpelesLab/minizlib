@@ -7,7 +7,7 @@
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use minigunzip::{Error, NO_LIMIT, Reader, Stream, decompress, decompress_len};
+use minizlib::{Error, NO_LIMIT, Reader, Stream, decompress, decompress_len};
 
 fn main() -> ExitCode {
     let len_only = std::env::args().nth(1).as_deref() == Some("--len");

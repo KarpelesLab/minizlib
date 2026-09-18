@@ -43,7 +43,7 @@
 //!
 //! ```
 //! # #[cfg(feature = "gzip")] {
-//! use minigunzip::{gunzip, Buffer};
+//! use minizlib::{gunzip, Buffer};
 //!
 //! let gz = [
 //!     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
@@ -53,14 +53,14 @@
 //! let len = gunzip(&gz[..], Buffer::new(&mut out))? as usize;
 //! assert_eq!(&out[..len], b"hello hello hello hello");
 //! # }
-//! # Ok::<(), minigunzip::Error>(())
+//! # Ok::<(), minizlib::Error>(())
 //! ```
 //!
 //! Stream to stream, sizing things up first:
 //!
 //! ```
 //! # #[cfg(feature = "gzip")] {
-//! use minigunzip::{gunzip, gunzip_len, Error, Reader, Stream};
+//! use minizlib::{gunzip, gunzip_len, Error, Reader, Stream};
 //!
 //! # let gz = [
 //! #     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
@@ -86,7 +86,7 @@
 //! gunzip(input, output)?;
 //! assert_eq!(total, 23);
 //! # }
-//! # Ok::<(), minigunzip::Error>(())
+//! # Ok::<(), minizlib::Error>(())
 //! ```
 //!
 //! # Features

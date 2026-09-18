@@ -1,4 +1,4 @@
-# minigunzip
+# minizlib
 
 A tiny gzip / zlib / deflate decompressor for Rust: `no_std`, no allocation,
 no `unsafe`, no dependencies, no panics, and as little code as possible.
@@ -8,7 +8,7 @@ you strip that down further. Buffer in or stream in, buffer out or stream out,
 and go.
 
 ```rust
-use minigunzip::{gunzip, Buffer};
+use minizlib::{gunzip, Buffer};
 
 let mut out = [0; 4096];
 let len = gunzip(gz_bytes, Buffer::new(&mut out))? as usize;
@@ -52,7 +52,7 @@ name / comment / extra fields, and concatenated members.
 ### Streaming
 
 ```rust
-use minigunzip::{gunzip, Error, Reader, Stream};
+use minizlib::{gunzip, Error, Reader, Stream};
 
 let mut scratch = [0; 64];
 let input = Reader::new(&mut scratch, |buf| uart.read(buf).map_err(|_| Error::Io));
@@ -87,7 +87,7 @@ unverified.
 Everything is on by default except `crc-table`. To strip what you don't need:
 
 ```toml
-minigunzip = { version = "0.1", default-features = false, features = ["gzip", "dynamic"] }
+minizlib = { version = "0.1", default-features = false, features = ["gzip", "dynamic"] }
 ```
 
 | feature     | what it does |

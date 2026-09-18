@@ -2,7 +2,7 @@
 #![no_main]
 
 #[allow(unused_imports)]
-use minigunzip::*;
+use minizlib::*;
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

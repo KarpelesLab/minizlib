@@ -1,4 +1,4 @@
-# Bare-metal binary exercising minigunzip, to measure its code size and to
+# Bare-metal binary exercising minizlib, to measure its code size and to
 # prove that no panic machinery gets linked. See check.sh.
 [package]
 name = "footprint"
@@ -12,7 +12,7 @@ stream = []
 len = []
 
 [dependencies]
-minigunzip = { path = "../..", default-features = false }
+minizlib = { path = "../..", default-features = false }
 
 [profile.release]
 opt-level = "z"
