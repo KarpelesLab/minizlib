@@ -12,6 +12,8 @@ stream = []
 len = []
 compress = []
 compress-stream = []
+compress-push = []
+push = []
 
 [dependencies]
 minizlib = { path = "../..", default-features = false }

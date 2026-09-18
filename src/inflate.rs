@@ -11,53 +11,109 @@ use crate::{Checksum, Error, Input, Output};
 const MAX_BITS: usize = 15;
 /// Most literal/length symbols a block can define.
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_LEN_SYMS: usize = 288;
+pub(crate) const MAX_LEN_SYMS: usize = 288;
 /// Most distance symbols a block can define.
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
 const MAX_DIST_SYMS: usize = 32;
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
-const MAX_SYMS: usize = MAX_LEN_SYMS + MAX_DIST_SYMS;
+pub(crate) const MAX_SYMS: usize = MAX_LEN_SYMS + MAX_DIST_SYMS;
+
+/// How many codes there are of each length. Aligned so that clearing it is a
+/// job for `memclr4`, which is linked anyway, rather than for another routine
+/// of `compiler_builtins`.
+#[cfg(any(feature = "fixed", feature = "dynamic"))]
+#[repr(align(4))]
+pub(crate) struct Counts([u16; MAX_BITS + 1]);
+
+/// The storage of the two codes of a block: on the stack for the pull
+/// decoder, in the context of the push decoder.
+#[cfg(any(feature = "fixed", feature = "dynamic"))]
+pub(crate) struct Tables {
+    counts: [Counts; 2],
+    symbol: [u16; MAX_SYMS],
+}
+
+#[cfg(any(feature = "fixed", feature = "dynamic"))]
+impl Tables {
+    pub(crate) fn new() -> Self {
+        Tables {
+            counts: [Counts([0; MAX_BITS + 1]), Counts([0; MAX_BITS + 1])],
+            symbol: [0; MAX_SYMS],
+        }
+    }
+
+    /// The literal/length code and the distance code, to `build` or built.
+    #[inline]
+    pub(crate) fn codes(&mut self) -> (Huffman<'_>, Huffman<'_>) {
+        let [len_count, dist_count] = &mut self.counts;
+        let (len_symbol, dist_symbol) = self.symbol.split_at_mut(MAX_LEN_SYMS);
+        (
+            Huffman::new(len_count, len_symbol),
+            Huffman::new(dist_count, dist_symbol),
+        )
+    }
+}
+
+/// Order in which the code length code lengths are stored.
+#[cfg(feature = "dynamic")]
+pub(crate) const ORDER: [u8; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 /// The decoder: a bit reader over the input, which the containers also read
 /// their headers and trailers through, the output and its checksum.
+///
+/// Whatever loops here is made of steps that are methods of their own, for
+/// the push decoder to take one at a time: see `push`.
 pub(crate) struct Inflate<'a, I, O, C> {
-    input: &'a mut I,
+    pub(crate) input: &'a mut I,
     pub(crate) out: &'a mut O,
     pub(crate) check: C,
-    bit_buf: u32,
-    bit_cnt: u32,
+    pub(crate) bit_buf: u32,
+    pub(crate) bit_cnt: u32,
     /// The first failure of the input. From then on it reads as zeros, which
     /// spares an error path at every read; see `bits`.
-    status: Result<(), Error>,
+    pub(crate) status: Result<(), Error>,
 }
 
 /// A canonical Huffman code: `count[n]` codes of `n` bits each, and the
 /// symbols they decode to, ordered by code.
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
-struct Huffman<'a> {
-    count: [u16; MAX_BITS + 1],
+pub(crate) struct Huffman<'a> {
+    count: &'a mut Counts,
     symbol: &'a mut [u16],
     /// The number of unused codes: zero for a complete code, negative for an
     /// over-subscribed one.
     #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
-    left: i32,
+    pub(crate) left: i32,
+}
+
+/// What a literal/length symbol stands for.
+#[cfg(any(feature = "fixed", feature = "dynamic"))]
+pub(crate) enum Symbol {
+    /// A literal, which went to the output.
+    Literal,
+    /// The end of the block.
+    End,
+    /// A match of this length, whose distance follows.
+    Match(u32),
 }
 
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
 impl<'a> Huffman<'a> {
-    /// An empty code, to `build` in place: returning a built one by value
-    /// would copy it, and drag `memcpy` in.
-    fn new(symbol: &'a mut [u16]) -> Self {
+    /// A code to `build`, over storage of the caller's.
+    fn new(count: &'a mut Counts, symbol: &'a mut [u16]) -> Self {
         Huffman {
-            count: [0; MAX_BITS + 1],
+            count,
             symbol,
             left: 1,
         }
     }
 
-    /// Builds an empty code from the code length of each symbol.
-    fn build(&mut self, lengths: &[u8]) {
-        let count = &mut self.count;
+    /// Builds the code from the code length of each symbol.
+    pub(crate) fn build(&mut self, lengths: &[u8]) {
+        let count = &mut self.count.0;
+        *count = [0; MAX_BITS + 1];
         for &len in lengths {
             count[(len & 15) as usize] += 1;
         }
@@ -89,8 +145,47 @@ impl<'a> Huffman<'a> {
     /// distances: complete, or made of a single one-bit code.
     #[cfg(feature = "dynamic")]
     fn is_valid(&self, symbols: usize) -> bool {
-        self.left == 0 || (self.left > 0 && symbols == (self.count[0] + self.count[1]) as usize)
+        let count = &self.count.0;
+        self.left == 0 || (self.left > 0 && symbols == (count[0] + count[1]) as usize)
     }
+}
+
+/// The code lengths of the fixed codes: the literals/lengths, then all 32
+/// five-bit distance codes, to make that code complete. The last two are
+/// rejected when they come up.
+#[cfg(feature = "fixed")]
+pub(crate) fn fixed_lengths(lengths: &mut [u8; MAX_SYMS]) {
+    const RUNS: [(u8, u8); 5] = [(144, 8), (112, 9), (24, 7), (8, 8), (32, 5)];
+    let mut rest = &mut lengths[..];
+    for (count, len) in RUNS {
+        let Some((run, tail)) = rest.split_at_mut_checked(count as usize) else {
+            break;
+        };
+        run.fill(len);
+        rest = tail;
+    }
+}
+
+/// Builds the two codes of a compressed block given the code length of each
+/// literal/length symbol, directly followed by those of the distance symbols.
+/// Returns whether both codes are ones deflate permits.
+#[cfg(any(feature = "fixed", feature = "dynamic"))]
+pub(crate) fn build_codes(
+    lengths: &[u8],
+    len_syms: usize,
+    len_code: &mut Huffman,
+    dist_code: &mut Huffman,
+) -> Result<bool, Error> {
+    let (len_lengths, dist_lengths) = lengths
+        .split_at_checked(len_syms)
+        .ok_or(Error::InvalidBlock)?;
+    len_code.build(len_lengths);
+    dist_code.build(dist_lengths);
+    #[cfg(feature = "dynamic")]
+    if !len_code.is_valid(len_lengths.len()) || !dist_code.is_valid(dist_lengths.len()) {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
@@ -139,6 +234,11 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         value as u16
     }
 
+    /// Skips to the next byte boundary.
+    pub(crate) fn align(&mut self) {
+        self.bits(self.bit_cnt & 7);
+    }
+
     /// Skips `bytes` bytes. Only valid on a byte boundary.
     #[cfg(feature = "gzip")]
     pub(crate) fn skip(&mut self, bytes: u16) {
@@ -168,66 +268,55 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         }
         // Input is only ever fetched a byte at a time, so the bits left over
         // are padding and nothing past the end of the stream was consumed.
-        self.bit_cnt = 0;
-        self.bit_buf = 0;
+        self.align();
         self.out.flush(&mut self.check)
     }
 
     #[cfg(feature = "stored")]
     fn stored(&mut self) -> Result<(), Error> {
-        // Skip to the next byte boundary.
-        self.bit_buf = 0;
-        self.bit_cnt = 0;
-        let len = self.bits(16);
-        if self.bits(16) != !len {
-            return Err(Error::InvalidBlock);
-        }
-        for _ in 0..len {
-            let byte = self.bits(8) as u8;
-            self.status?;
-            self.out.put(byte, &mut self.check)?;
+        for _ in 0..self.stored_len()? {
+            self.stored_byte()?;
         }
         Ok(())
     }
 
+    /// Reads the length of a stored block.
+    #[cfg(feature = "stored")]
+    pub(crate) fn stored_len(&mut self) -> Result<u16, Error> {
+        self.align();
+        let len = self.bits(16);
+        if self.bits(16) != !len {
+            return Err(Error::InvalidBlock);
+        }
+        Ok(len)
+    }
+
+    /// Copies one byte of a stored block to the output.
+    #[cfg(feature = "stored")]
+    pub(crate) fn stored_byte(&mut self) -> Result<(), Error> {
+        let byte = self.bits(8) as u8;
+        self.status?;
+        self.out.put(byte, &mut self.check)
+    }
+
     #[cfg(feature = "fixed")]
     fn fixed(&mut self) -> Result<(), Error> {
-        // Code lengths, by runs of symbols: the literals/lengths, then all 32
-        // five-bit distance codes, to make that code complete. The last two
-        // are rejected when they come up.
-        const RUNS: [(u8, u8); 5] = [(144, 8), (112, 9), (24, 7), (8, 8), (32, 5)];
         let mut lengths = [0u8; MAX_SYMS];
-        let mut rest = &mut lengths[..];
-        for (count, len) in RUNS {
-            let Some((run, tail)) = rest.split_at_mut_checked(count as usize) else {
-                break;
-            };
-            run.fill(len);
-            rest = tail;
-        }
+        fixed_lengths(&mut lengths);
         self.compressed(&lengths, MAX_LEN_SYMS).map(drop)
     }
 
     #[cfg(feature = "dynamic")]
     fn dynamic(&mut self) -> Result<(), Error> {
-        /// Order in which the code length code lengths are stored.
-        const ORDER: [u8; 19] = [
-            16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
-        ];
-
-        let len_syms = self.bits(5) as usize + 257;
-        let dist_syms = self.bits(5) as usize + 1;
-        let code_syms = self.bits(4) as usize + 4;
-        if len_syms > 286 || dist_syms > 30 {
-            return Err(Error::InvalidBlock);
-        }
+        let (len_syms, dist_syms, code_syms) = self.dynamic_head()?;
 
         let mut lengths = [0u8; MAX_SYMS];
         for &sym in ORDER.iter().take(code_syms) {
             lengths[(sym & 31) as usize] = self.bits(3) as u8;
         }
+        let mut count = Counts([0; MAX_BITS + 1]);
         let mut symbol = [0; 19];
-        let mut code = Huffman::new(&mut symbol);
+        let mut code = Huffman::new(&mut count, &mut symbol);
         code.build(&lengths[..19]);
         if code.left != 0 {
             return Err(Error::InvalidCode);
@@ -239,24 +328,7 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
             .ok_or(Error::InvalidBlock)?;
         let mut index = 0;
         while index < lengths.len() {
-            let sym = self.decode(&code)?;
-            let (len, repeat) = match sym {
-                0..=15 => (sym as u8, 1),
-                16 => {
-                    let prev = *lengths
-                        .get(index.wrapping_sub(1))
-                        .ok_or(Error::InvalidCode)?;
-                    (prev, 3 + self.bits(2))
-                }
-                17 => (0, 3 + self.bits(3)),
-                _ => (0, 11 + self.bits(7)),
-            };
-            let end = index + repeat as usize;
-            lengths
-                .get_mut(index..end)
-                .ok_or(Error::InvalidCode)?
-                .fill(len);
-            index = end;
+            index = self.code_lengths(&code, lengths, index)?;
         }
 
         // A block without an end-of-block code could never finish.
@@ -269,64 +341,112 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         }
     }
 
+    /// Reads how many literal/length, distance and code length symbols a
+    /// dynamic block defines.
+    #[cfg(feature = "dynamic")]
+    pub(crate) fn dynamic_head(&mut self) -> Result<(usize, usize, usize), Error> {
+        let len_syms = self.bits(5) as usize + 257;
+        let dist_syms = self.bits(5) as usize + 1;
+        let code_syms = self.bits(4) as usize + 4;
+        if len_syms > 286 || dist_syms > 30 {
+            return Err(Error::InvalidBlock);
+        }
+        Ok((len_syms, dist_syms, code_syms))
+    }
+
+    /// Decodes one code length symbol into `lengths`, from `index` on. Returns
+    /// the index after the run of lengths it stood for.
+    #[cfg(feature = "dynamic")]
+    pub(crate) fn code_lengths(
+        &mut self,
+        code: &Huffman,
+        lengths: &mut [u8],
+        index: usize,
+    ) -> Result<usize, Error> {
+        let sym = self.decode(code)?;
+        let (len, repeat) = match sym {
+            0..=15 => (sym as u8, 1),
+            16 => {
+                let prev = *lengths
+                    .get(index.wrapping_sub(1))
+                    .ok_or(Error::InvalidCode)?;
+                (prev, 3 + self.bits(2))
+            }
+            17 => (0, 3 + self.bits(3)),
+            _ => (0, 11 + self.bits(7)),
+        };
+        let end = index + repeat as usize;
+        lengths
+            .get_mut(index..end)
+            .ok_or(Error::InvalidCode)?
+            .fill(len);
+        Ok(end)
+    }
+
     /// Decodes a compressed block given the code length of each literal/length
     /// symbol, directly followed by those of the distance symbols. Returns
     /// whether both codes were ones deflate permits.
     #[cfg(any(feature = "fixed", feature = "dynamic"))]
     fn compressed(&mut self, lengths: &[u8], len_syms: usize) -> Result<bool, Error> {
-        let (len_lengths, dist_lengths) = lengths
-            .split_at_checked(len_syms)
-            .ok_or(Error::InvalidBlock)?;
-        let mut symbol = [0; MAX_SYMS];
-        let (len_symbol, dist_symbol) = symbol.split_at_mut(MAX_LEN_SYMS);
-        let mut len_code = Huffman::new(len_symbol);
-        let mut dist_code = Huffman::new(dist_symbol);
-        len_code.build(len_lengths);
-        dist_code.build(dist_lengths);
-        #[cfg(feature = "dynamic")]
-        if !len_code.is_valid(len_lengths.len()) || !dist_code.is_valid(dist_lengths.len()) {
+        let mut tables = Tables::new();
+        let (mut len_code, mut dist_code) = tables.codes();
+        if !build_codes(lengths, len_syms, &mut len_code, &mut dist_code)? {
             return Ok(false);
         }
 
         loop {
-            let sym = self.decode(&len_code)? as u32;
-            if sym < 256 {
-                self.out.put(sym as u8, &mut self.check)?;
-                continue;
+            match self.length(&len_code)? {
+                Symbol::Literal => {}
+                Symbol::End => return Ok(true),
+                Symbol::Match(len) => self.distance(&dist_code, len)?,
             }
-            if sym == 256 {
-                return Ok(true);
-            }
-
-            // Lengths 3..=258 from symbols 257..=285: four symbols for each
-            // count of extra bits, except at both ends.
-            let sym = sym - 257;
-            let len = match sym {
-                0..=3 => sym + 3,
-                4..=27 => {
-                    let extra = (sym - 4) >> 2;
-                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra) as u32
-                }
-                28 => 258,
-                _ => return Err(Error::InvalidCode),
-            };
-
-            // Distances 1..=32768 from symbols 0..=29, two symbols for each
-            // count of extra bits.
-            let sym = self.decode(&dist_code)? as u32;
-            let dist = match sym {
-                0..=1 => sym + 1,
-                2..=29 => {
-                    let extra = (sym - 2) >> 1;
-                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra) as u32
-                }
-                _ => return Err(Error::InvalidCode),
-            };
-
-            self.status?;
-            self.out
-                .copy(dist as usize, len as usize, &mut self.check)?;
         }
+    }
+
+    /// Decodes a literal/length symbol, and outputs it if it is a literal.
+    #[cfg(any(feature = "fixed", feature = "dynamic"))]
+    pub(crate) fn length(&mut self, code: &Huffman) -> Result<Symbol, Error> {
+        let sym = self.decode(code)? as u32;
+        if sym < 256 {
+            self.out.put(sym as u8, &mut self.check)?;
+            return Ok(Symbol::Literal);
+        }
+        if sym == 256 {
+            return Ok(Symbol::End);
+        }
+
+        // Lengths 3..=258 from symbols 257..=285: four symbols for each
+        // count of extra bits, except at both ends.
+        let sym = sym - 257;
+        let len = match sym {
+            0..=3 => sym + 3,
+            4..=27 => {
+                let extra = (sym - 4) >> 2;
+                ((4 + (sym & 3)) << extra) + 3 + self.bits(extra) as u32
+            }
+            28 => 258,
+            _ => return Err(Error::InvalidCode),
+        };
+        Ok(Symbol::Match(len))
+    }
+
+    /// Decodes the distance of a match of `len` bytes, and outputs the match.
+    #[cfg(any(feature = "fixed", feature = "dynamic"))]
+    pub(crate) fn distance(&mut self, code: &Huffman, len: u32) -> Result<(), Error> {
+        // Distances 1..=32768 from symbols 0..=29, two symbols for each
+        // count of extra bits.
+        let sym = self.decode(code)? as u32;
+        let dist = match sym {
+            0..=1 => sym + 1,
+            2..=29 => {
+                let extra = (sym - 2) >> 1;
+                ((2 + (sym & 1)) << extra) + 1 + self.bits(extra) as u32
+            }
+            _ => return Err(Error::InvalidCode),
+        };
+
+        self.status?;
+        self.out.copy(dist as usize, len as usize, &mut self.check)
     }
 
     #[cfg(any(feature = "fixed", feature = "dynamic"))]
@@ -334,7 +454,7 @@ impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
         let mut bits = 0i32;
         let mut first = 0i32;
         let mut index = 0i32;
-        for &count in &code.count[1..] {
+        for &count in &code.count.0[1..] {
             let count = count as i32;
             bits |= self.bits(1) as i32;
             if bits - count < first {

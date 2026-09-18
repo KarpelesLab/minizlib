@@ -34,12 +34,14 @@ let len = gzip(data, &mut table, Buffer::new(&mut gz))? as usize;
 | buffer in            | `&[u8]`, or `&mut &[u8]` to get the unconsumed rest back |
 | stream in (callback) | `Reader::new(&mut scratch, \|buf\| ...)`, scratch of any size |
 | stream in (iterator) | `Bytes(iter)`            |
+| stream in (pushed)   | `Decompressor`, a piece at a time, as it comes |
 | anything else        | implement `Input`, a single `fn byte()` |
 
 | input to compress    | how                      |
 |----------------------|--------------------------|
 | buffer in            | `&[u8]`                  |
 | stream in            | `Compressor`, a chunk at a time |
+| stream in (pushed)   | `BufferedCompressor`, a piece at a time, as it comes |
 
 | output                | how                                  | memory needed            |
 |-----------------------|--------------------------------------|--------------------------|
@@ -49,8 +51,8 @@ let len = gzip(data, &mut table, Buffer::new(&mut gz))? as usize;
 
 Every function takes any input with any output, and returns the number of
 bytes produced. Pass `&mut input` or `&mut output` to keep using them
-afterwards. Beyond the above, decompressing uses about 1.5 KiB of stack, and
-compressing next to none.
+afterwards. Beyond the above, decompressing uses about 1.5 KiB of stack, or
+1.1 KiB inside a `Decompressor`, and compressing next to none.
 
 Every path is bounded, so a decompression bomb cannot run away: a `Buffer` by
 its size, a `Stream`, a `Counter` and the `*_len` functions by a mandatory
@@ -79,6 +81,33 @@ with `Error::WindowTooSmall`. 32 KiB covers everything; if you control the
 compressor (`wbits` in zlib), a smaller window works with a smaller buffer.
 The decoder never reads past the end of the compressed stream, apart from the
 one look-ahead byte the `concat` feature needs.
+
+### Pushing
+
+The above pull their input as they need it, and return once done. When the
+input is not yours to ask for, and comes in pieces of whatever size a socket,
+a UART or a protocol hands over, push it instead:
+
+```rust
+use minizlib::{Decompressor, Detect, Error, Stream, NO_LIMIT};
+
+let mut window = [0; 32768];
+let output = Stream::new(&mut window, NO_LIMIT, |data| flash.write(data).map_err(|_| Error::Io));
+
+let mut decompressor = Decompressor::<_, Detect>::new(output); // gzip or zlib, whichever comes
+while let Some(piece) = socket.next_piece() {
+    decompressor.write(piece)?; // a byte or a megabyte, either way
+}
+let len = decompressor.finish()?;
+```
+
+`Gzip`, `Zlib`, `Raw` and `Detect` pick the container. Every `write` decodes
+as far as the input goes and delivers the result, without waiting for a window
+to fill up, and returns how much it consumed: all of it, unless the stream
+ended first. `finish` fails with `Error::UnexpectedEof` if the stream did not.
+The context the decoder keeps between pieces, the codes of the current block
+mostly, is the 1.1 KiB the `Decompressor` itself takes. It runs at about 90 %
+of the speed of the pull decoder, 70 % when fed a byte at a time.
 
 ### Compressing
 
@@ -119,6 +148,13 @@ empty one still gets the Huffman coding done. On 8.7 MB of source code:
 Matches are only looked for within a chunk, so larger chunks compress better
 (34 % with chunks of 32 KiB, 42 % with 4 KiB, same table of 4096), and each
 chunk costs ten bits. What cannot be compressed grows by an eighth at worst.
+
+When the chunks are not yours to choose, `BufferedCompressor::new(output,
+&mut table, &mut buffer)` takes pieces of any size, a byte at a time if need
+be, gathers them in `buffer`, and compresses it each time it fills up: a
+32 KiB buffer gets the 32 KiB chunk figure above whatever the pieces, and
+what comes out does not depend on how the data was cut. A buffer's worth
+pushed at once is compressed from where it is, without a copy.
 
 The price of the small code is the ratio: fixed Huffman codes and no lazy
 matching. Entering the positions that a match skips into the table would gain
@@ -175,17 +211,21 @@ table, and CI runs it to keep the no-panic guarantee honest.
 
 | configuration                                   | bytes |
 |-------------------------------------------------|------:|
-| gzip, default features                          |  2424 |
-| … with `crc-table`                              |  3368 |
-| … without `concat`                              |  2310 |
-| … without `concat` and `checksum`               |  2103 |
-| gzip, `dynamic` blocks only                     |  1895 |
-| gzip, `fixed` blocks only                       |  1582 |
-| gzip, `stored` blocks only                      |   506 |
-| stream in / stream out, default features        |  2752 |
-| length only, default features                   |  2267 |
+| gzip, default features                          |  2436 |
+| … with `crc-table`                              |  3382 |
+| … without `concat`                              |  2322 |
+| … without `concat` and `checksum`               |  2126 |
+| gzip, `dynamic` blocks only                     |  1933 |
+| gzip, `fixed` blocks only                       |  1584 |
+| gzip, `stored` blocks only                      |   518 |
+| stream in / stream out, default features        |  2758 |
+| length only, default features                   |  2294 |
+| pushed in, buffer out, default features         |  3454 |
+| … without `concat` and `checksum`               |  3084 |
+| … `fixed` blocks only                           |  2190 |
 | **compression**: gzip, buffer in, buffer out    |  1028 |
 | **compression**: gzip, stream in, stream out    |  1348 |
+| **compression**: gzip, pushed in, stream out    |  1538 |
 
 About 400 of the decompressor's bytes are the `memset` / `memclr` routines of
 `compiler_builtins`, which most firmware links anyway; the compressor needs
@@ -211,6 +251,14 @@ kept on the side, and the few loops that zeros would not stop, or that would
 output something, check for it. And nothing large is ever returned by value,
 which would drag `memcpy` in.
 
+The push decoder is the same decoder with its loops unrolled into a state
+machine, each state a step of 32 bits at most over the same primitives. A step
+runs on whatever input there is; if that runs out midway, the zeros it read
+guarantee that nothing was output, so the step is rolled back, the few bytes
+it had taken go into the bit buffer, and it is retried when more comes. That
+is what lets it keep just 1.1 KiB between pieces, and not depend on how big
+they are.
+
 What is left out: dynamic Huffman codes when compressing, preset dictionaries (`Error::Unsupported`),
 exposing the gzip header fields, and verifying the optional gzip header CRC,
 which gzip itself never writes.
@@ -220,7 +268,11 @@ which gzip itself never writes.
 `cargo test` round-trips a range of data shapes through flate2 at every
 compression level and every input / output combination, checks error
 reporting, truncates streams at every offset, and feeds the decoder tens of
-thousands of corrupted and random streams, checking all outputs agree.
+thousands of corrupted and random streams, checking all outputs agree. The
+push decoder gets the same streams cut into pieces of every size, a byte at a
+time included, and has to agree with the pull one on every outcome and every
+byte of output; the buffered compressor has to produce the same stream however
+its input is cut.
 The compressor's output is checked against both this crate's decompressor and
 flate2's, over data stitched from copies of every length and distance, tables
 of every size, cleared or not, and chunks of every size. `examples/gunzip.rs`

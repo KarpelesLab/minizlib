@@ -23,18 +23,22 @@
 //! [cz]: fn.zlib.html
 //! [cd]: fn.deflate.html
 //! [c]: struct.Compressor.html
+//! [bc]: struct.BufferedCompressor.html
+//! [dc]: struct.Decompressor.html
 //!
 //! | input to decompress  | how                           |
 //! |----------------------|-------------------------------|
 //! | buffer in            | `&[u8]`, or `&mut &[u8]`      |
 //! | stream in (callback) | [`Reader`]                    |
 //! | stream in (iterator) | [`Bytes`]                     |
+//! | stream in (pushed)   | [`Decompressor`][dc], a piece at a time |
 //! | anything else        | implement [`Input`]           |
 //!
 //! | input to compress    | how                           |
 //! |----------------------|-------------------------------|
 //! | buffer in            | `&[u8]`                       |
 //! | stream in            | [`Compressor`][c], a chunk at a time |
+//! | stream in (pushed)   | [`BufferedCompressor`][bc], a piece at a time |
 //!
 //! | output                | how                 | memory needed               |
 //! |-----------------------|---------------------|-----------------------------|
@@ -42,9 +46,14 @@
 //! | stream out (callback) | [`Stream`]          | a window, usually 32 KiB    |
 //! | none, just the length | [`Counter`]         | none                        |
 //!
-//! On top of that, decompressing uses about 1.5 KiB of stack. Compressing uses
-//! next to none, and a table of yours to find matches with: any size will do,
-//! 8 KiB is a good deal.
+//! On top of that, decompressing uses about 1.5 KiB of stack, or 1.1 KiB in a
+//! [`Decompressor`][dc], which has to keep it between pieces. Compressing
+//! uses next to none, and a table of yours to find matches with: any size
+//! will do, 8 KiB is a good deal.
+//!
+//! The pushed inputs are for when the input is not yours to ask for, and
+//! comes in pieces of whatever size, over a socket or a UART say: everything
+//! else pulls its input as it needs it, and does not return until done.
 //!
 //! Every path is bounded: a [`Buffer`] by its size, a [`Stream`], a
 //! [`Counter`] and the length functions by a mandatory maximum length, beyond
@@ -103,17 +112,38 @@
 //! # Ok::<(), minizlib::Error>(())
 //! ```
 //!
-//! Compressing, in one go and then a chunk at a time:
+//! Pushed in, as the compressed data comes:
+//!
+//! ```
+//! # #[cfg(all(feature = "gzip", feature = "decompress"))] {
+//! use minizlib::{Buffer, Decompressor, Gzip};
+//!
+//! # let gz = [
+//! #     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
+//! #     0x57, 0xc8, 0x40, 0x27, 0x01, 0xe3, 0x51, 0x3d, 0x8d, 0x17, 0x00, 0x00, 0x00,
+//! # ];
+//! let mut out = [0; 64];
+//! let mut decompressor = Decompressor::<_, Gzip>::new(Buffer::new(&mut out));
+//! for piece in gz.chunks(3) { // whatever the socket hands over
+//!     decompressor.write(piece)?;
+//! }
+//! let len = decompressor.finish()? as usize;
+//! assert_eq!(&out[..len], b"hello hello hello hello");
+//! # }
+//! # Ok::<(), minizlib::Error>(())
+//! ```
+//!
+//! Compressing, in one go, then a chunk at a time, then pushed in:
 //!
 //! ```
 //! # #[cfg(all(feature = "gzip", feature = "compress", feature = "decompress"))] {
-//! use minizlib::{gunzip, gzip, Buffer, Compressor, Gzip};
+//! use minizlib::{gunzip, gzip, Buffer, BufferedCompressor, Compressor, Gzip};
 //!
 //! let data = b"hello hello hello hello";
 //! let mut table = [0; 256];
 //! let mut gz = [0; 64];
-//! let len = gzip(data, &mut table, Buffer::new(&mut gz))? as usize;
-//! assert!(len < data.len() + 18);
+//! let whole = gzip(data, &mut table, Buffer::new(&mut gz))? as usize;
+//! assert!(whole < data.len() + 18);
 //!
 //! let mut out = [0; 64];
 //! let mut compressor = Compressor::<_, Gzip>::new(Buffer::new(&mut out), &mut table);
@@ -125,6 +155,16 @@
 //! let mut back = [0; 64];
 //! let back_len = gunzip(&out[..len], Buffer::new(&mut back))? as usize;
 //! assert_eq!(&back[..back_len], data);
+//!
+//! // Pieces of any size compress as well as chunks the size of the buffer:
+//! // here, as the whole.
+//! let mut buffer = [0; 32];
+//! let mut compressor =
+//!     BufferedCompressor::<_, Gzip>::new(Buffer::new(&mut out), &mut table, &mut buffer);
+//! for piece in data.chunks(1) {
+//!     compressor.write(piece)?;
+//! }
+//! assert_eq!(compressor.finish()? as usize, whole);
 //! # }
 //! # Ok::<(), minizlib::Error>(())
 //! ```
@@ -163,18 +203,26 @@ mod checksum;
 mod container;
 #[cfg(feature = "compress")]
 mod deflate;
+mod format;
 #[cfg(feature = "decompress")]
 mod inflate;
 mod io;
+#[cfg(feature = "decompress")]
+mod push;
 
 pub use checksum::Checksum;
-#[cfg(all(feature = "compress", feature = "gzip"))]
-pub use deflate::Gzip;
-#[cfg(all(feature = "compress", feature = "zlib"))]
-pub use deflate::Zlib;
 #[cfg(feature = "compress")]
-pub use deflate::{Compressor, Format, Raw};
+pub use deflate::{BufferedCompressor, Compressor};
+#[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
+pub use format::Detect;
+#[cfg(feature = "gzip")]
+pub use format::Gzip;
+#[cfg(feature = "zlib")]
+pub use format::Zlib;
+pub use format::{Container, Format, Raw};
 pub use io::{Buffer, Bytes, Counter, Input, Output, Reader, Stream};
+#[cfg(feature = "decompress")]
+pub use push::Decompressor;
 
 use core::fmt;
 

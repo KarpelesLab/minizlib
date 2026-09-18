@@ -7,13 +7,7 @@
 //! reach; what it cannot tell, such as a stale or never written entry, is
 //! caught by comparing the data, which has to be done anyway.
 
-#[cfg(any(feature = "gzip", feature = "zlib"))]
-use crate::Checksum;
-#[cfg(feature = "zlib")]
-use crate::checksum::Adler32;
-#[cfg(feature = "gzip")]
-use crate::checksum::Crc32;
-use crate::{Error, Output};
+use crate::{Error, Format, Output};
 
 const MIN_MATCH: usize = 3;
 const MAX_MATCH: usize = 258;
@@ -22,101 +16,6 @@ const MAX_DIST: usize = 32768;
 const TOO_FAR: usize = 4096;
 
 const END_OF_BLOCK: u32 = 256;
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// A container for compressed data: [`Gzip`](struct.Gzip.html),
-/// [`Zlib`](struct.Zlib.html) or [`Raw`].
-pub trait Format: sealed::Sealed {
-    #[doc(hidden)]
-    const HEADER: &'static [u8];
-    /// How many of the `trailer` words to write.
-    #[doc(hidden)]
-    const TRAILER: usize;
-    #[doc(hidden)]
-    fn new() -> Self;
-    #[doc(hidden)]
-    fn update(&mut self, data: &[u8]);
-    /// The trailer, as little-endian words, given the length of the data
-    /// modulo 2<sup>32</sup>.
-    #[doc(hidden)]
-    fn trailer(&self, size: u32) -> [u32; 2];
-}
-
-/// The gzip format (RFC 1952), as produced by `gzip`.
-#[cfg(feature = "gzip")]
-pub struct Gzip(Crc32);
-
-#[cfg(feature = "gzip")]
-impl sealed::Sealed for Gzip {}
-
-#[cfg(feature = "gzip")]
-impl Format for Gzip {
-    // Deflate, no flags, no modification time, no extra flags, unknown OS.
-    const HEADER: &'static [u8] = &[0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff];
-    const TRAILER: usize = 2;
-
-    fn new() -> Self {
-        Gzip(Crc32::new())
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    fn trailer(&self, size: u32) -> [u32; 2] {
-        [self.0.value(), size]
-    }
-}
-
-/// The zlib format (RFC 1950).
-#[cfg(feature = "zlib")]
-pub struct Zlib(Adler32);
-
-#[cfg(feature = "zlib")]
-impl sealed::Sealed for Zlib {}
-
-#[cfg(feature = "zlib")]
-impl Format for Zlib {
-    // Deflate with a 32 KiB window, fastest algorithm, no dictionary.
-    const HEADER: &'static [u8] = &[0x78, 0x01];
-    const TRAILER: usize = 1;
-
-    fn new() -> Self {
-        Zlib(Adler32::new())
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        self.0.update(data);
-    }
-
-    fn trailer(&self, _: u32) -> [u32; 2] {
-        // Big-endian.
-        [self.0.value().swap_bytes(), 0]
-    }
-}
-
-/// A raw deflate stream (RFC 1951): no header, no checksum.
-pub struct Raw;
-
-impl sealed::Sealed for Raw {}
-
-impl Format for Raw {
-    const HEADER: &'static [u8] = &[];
-    const TRAILER: usize = 0;
-
-    fn new() -> Self {
-        Raw
-    }
-
-    fn update(&mut self, _: &[u8]) {}
-
-    fn trailer(&self, _: u32) -> [u32; 2] {
-        [0; 2]
-    }
-}
 
 /// The base two logarithm of `value`, rounded down. Unlike `ilog2`, it has no
 /// panic to link for a zero it is never given.
@@ -139,7 +38,8 @@ fn log2(value: u32) -> u32 {
 ///
 /// Matches are only looked for within a chunk, so larger chunks compress
 /// better, until they reach a few times deflate's 32 KiB reach. Each chunk
-/// also costs ten bits.
+/// also costs ten bits. When the chunks are not yours to choose, a
+/// [`BufferedCompressor`] gathers them.
 pub struct Compressor<'t, O, F> {
     out: O,
     format: F,
@@ -318,5 +218,85 @@ impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
             self.bit_cnt -= 8;
         }
         Ok(())
+    }
+}
+
+/// Stream in, pushed: a [`Compressor`] for data that comes in pieces of any
+/// size, a byte at a time if need be.
+///
+/// A [`Compressor`] makes a block of each chunk it is given, and only looks
+/// for matches within it, so it wants chunks of a decent size. When their
+/// size is not yours to choose, this gathers them in `buffer` and compresses
+/// it each time it fills up, and once more on [`finish`](Self::finish). What
+/// comes out only depends on the data and on the size of the buffer, not on
+/// how the data was cut. A buffer's worth of data pushed at once is
+/// compressed from where it is, without a copy.
+///
+/// The buffer is what matches get found in, and bounds how long data waits
+/// before it is compressed: any size will do, 32 KiB leaves little to gain,
+/// and see [`Compressor`] for what smaller ones cost. An empty one makes this
+/// a plain [`Compressor`].
+pub struct BufferedCompressor<'t, O, F> {
+    inner: Compressor<'t, O, F>,
+    buffer: &'t mut [u8],
+    len: usize,
+}
+
+impl<'t, O: Output, F: Format> BufferedCompressor<'t, O, F> {
+    /// Starts a compressed stream. See [`Compressor::new`].
+    #[inline(always)]
+    pub fn new(output: O, table: &'t mut [u16], buffer: &'t mut [u8]) -> Self {
+        BufferedCompressor {
+            inner: Compressor::new(output, table),
+            buffer,
+            len: 0,
+        }
+    }
+
+    /// Takes the next piece of data, of any length.
+    pub fn write(&mut self, mut data: &[u8]) -> Result<(), Error> {
+        while !data.is_empty() {
+            let room = self.buffer.get_mut(self.len..).unwrap_or(&mut []);
+            if self.len == 0 && data.len() >= room.len() {
+                // A whole buffer's worth, or all there is without a buffer.
+                let len = if room.is_empty() {
+                    data.len()
+                } else {
+                    room.len()
+                };
+                let Some((chunk, rest)) = data.split_at_checked(len) else {
+                    break;
+                };
+                self.inner.write(chunk)?;
+                data = rest;
+                continue;
+            }
+            let len = room.len().min(data.len());
+            for (slot, &byte) in room.iter_mut().zip(data) {
+                *slot = byte;
+            }
+            self.len += len;
+            data = data.get(len..).unwrap_or(&[]);
+            if len == room.len() {
+                self.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Ends the stream, compressing what the buffer still holds, writing the
+    /// trailer and flushing the output. Returns the length of the compressed
+    /// stream.
+    ///
+    /// The compressor is then ready for another stream, to the same output.
+    pub fn finish(&mut self) -> Result<u64, Error> {
+        self.flush()?;
+        self.inner.finish()
+    }
+
+    /// Compresses what the buffer holds.
+    fn flush(&mut self) -> Result<(), Error> {
+        let len = core::mem::take(&mut self.len);
+        self.inner.write(self.buffer.get(..len).unwrap_or(&[]))
     }
 }
