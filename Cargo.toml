@@ -1,0 +1,39 @@
+[package]
+name = "minigunzip"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Tiny no_std, no-alloc gzip / zlib / deflate decompressor"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/KarpelesLab/minigunzip"
+keywords = ["gzip", "zlib", "deflate", "inflate", "no_std"]
+categories = ["compression", "no-std", "no-std::no-alloc", "embedded"]
+
+[features]
+default = ["gzip", "zlib", "checksum", "concat", "stored", "fixed", "dynamic"]
+
+# Containers. Raw deflate is always available.
+gzip = []
+zlib = []
+
+# Verify CRC-32 / ISIZE (gzip) and Adler-32 (zlib) trailers.
+checksum = []
+# Use a 256-entry CRC-32 table (1 KiB) instead of the 16-entry one (64 B).
+crc-table = []
+# Decode concatenated gzip members (`cat a.gz b.gz`) as one stream.
+concat = []
+
+# Deflate block types. Disabled ones decode to `Error::Unsupported`.
+stored = []
+fixed = []
+dynamic = []
+
+[dev-dependencies]
+flate2 = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
