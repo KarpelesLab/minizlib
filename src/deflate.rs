@@ -3,7 +3,7 @@
 //! Huffman codes are decoded canonically, one bit at a time, from a count of
 //! codes per length and a list of symbols sorted by code, in the manner of
 //! zlib's `puff`. This is slower than table lookups but needs very little
-//! code and only about 1 KiB of stack.
+//! code and only about 1.5 KiB of stack.
 
 use crate::{Checksum, Error, Input, Output};
 
