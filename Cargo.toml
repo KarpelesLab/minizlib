@@ -1,6 +1,6 @@
 [package]
 name = "minizlib"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "Tiny no_std, no-alloc gzip / zlib / deflate compressor and decompressor"
