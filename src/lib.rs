@@ -182,7 +182,7 @@ impl core::error::Error for Error {}
 /// Decompresses a raw deflate stream. Returns the number of bytes produced.
 pub fn inflate<I: Input, O: Output>(mut input: I, mut output: O) -> Result<u64, Error> {
     let start = output.written();
-    deflate::inflate(&mut input, &mut output, &mut ())?;
+    deflate::Inflate::new(&mut input, &mut output, ()).inflate()?;
     Ok(output.written() - start)
 }
 

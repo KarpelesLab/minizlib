@@ -320,9 +320,11 @@ fn gzip_members() {
     // Trailing padding is ignored, a trailing broken member is not.
     gz.extend([0; 7]);
     assert_eq!(gunzip_len(&gz[..], NO_LIMIT).unwrap(), 18);
-    gz.extend([0x1f, 0x8c]);
-    gz.drain(gz.len() - 9..gz.len() - 2);
+    gz.truncate(gz.len() - 7);
+    gz.extend([0x1f, 0x8c, 8]);
     assert_eq!(gunzip_len(&gz[..], NO_LIMIT), Err(Error::InvalidHeader));
+    gz.pop();
+    assert_eq!(gunzip_len(&gz[..], NO_LIMIT), Err(Error::UnexpectedEof));
 }
 
 #[test]

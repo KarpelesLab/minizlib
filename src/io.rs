@@ -351,13 +351,3 @@ impl Output for Counter {
         self.count
     }
 }
-
-/// Reads a little-endian integer of `bytes` bytes, at most four.
-#[cfg(any(feature = "gzip", feature = "zlib"))]
-pub(crate) fn le<I: Input>(input: &mut I, bytes: u32) -> Result<u32, Error> {
-    let mut value = 0;
-    for i in 0..bytes {
-        value |= (input.byte()? as u32) << (8 * i);
-    }
-    Ok(value)
-}

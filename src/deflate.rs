@@ -18,44 +18,12 @@ const MAX_DIST_SYMS: usize = 32;
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
 const MAX_SYMS: usize = MAX_LEN_SYMS + MAX_DIST_SYMS;
 
-/// Decodes one raw deflate stream and flushes the output.
-pub(crate) fn inflate<I: Input, O: Output, C: Checksum>(
-    input: &mut I,
-    out: &mut O,
-    check: &mut C,
-) -> Result<(), Error> {
-    let mut state = Inflate {
-        input,
-        out,
-        check,
-        bit_buf: 0,
-        bit_cnt: 0,
-    };
-    loop {
-        let last = state.bits(1)? != 0;
-        match state.bits(2)? {
-            #[cfg(feature = "stored")]
-            0 => state.stored()?,
-            #[cfg(feature = "fixed")]
-            1 => state.fixed()?,
-            #[cfg(feature = "dynamic")]
-            2 => state.dynamic()?,
-            3 => return Err(Error::InvalidBlock),
-            _ => return Err(Error::Unsupported),
-        }
-        if last {
-            break;
-        }
-    }
-    // Input is only ever fetched a byte at a time, so the bits left over here
-    // are padding and nothing past the end of the stream was consumed.
-    out.flush(check)
-}
-
-struct Inflate<'a, I, O, C> {
+/// The decoder: a bit reader over the input, which the containers also read
+/// their headers and trailers through, the output and its checksum.
+pub(crate) struct Inflate<'a, I, O, C> {
     input: &'a mut I,
-    out: &'a mut O,
-    check: &'a mut C,
+    pub(crate) out: &'a mut O,
+    pub(crate) check: C,
     bit_buf: u32,
     bit_cnt: u32,
 }
@@ -66,30 +34,42 @@ struct Inflate<'a, I, O, C> {
 struct Huffman<'a> {
     count: [u16; MAX_BITS + 1],
     symbol: &'a mut [u16],
+    /// The number of unused codes: zero for a complete code, negative for an
+    /// over-subscribed one.
+    #[cfg_attr(not(feature = "dynamic"), allow(dead_code))]
+    left: i32,
 }
 
 #[cfg(any(feature = "fixed", feature = "dynamic"))]
-impl Huffman<'_> {
-    /// Builds the code from the code length of each symbol. Returns the number
-    /// of unused codes: zero for a complete code, negative if over-subscribed.
-    fn build(&mut self, lengths: &[u8]) -> i32 {
-        self.count = [0; MAX_BITS + 1];
+impl<'a> Huffman<'a> {
+    /// An empty code, to `build` in place: returning a built one by value
+    /// would copy it, and drag `memcpy` in.
+    fn new(symbol: &'a mut [u16]) -> Self {
+        Huffman {
+            count: [0; MAX_BITS + 1],
+            symbol,
+            left: 1,
+        }
+    }
+
+    /// Builds an empty code from the code length of each symbol.
+    fn build(&mut self, lengths: &[u8]) {
+        let count = &mut self.count;
         for &len in lengths {
-            self.count[(len & 15) as usize] += 1;
+            count[(len & 15) as usize] += 1;
         }
 
         let mut left = 1;
         let mut offsets = [0u16; MAX_BITS + 1];
         for len in 1..=MAX_BITS {
-            left = (left << 1) - self.count[len] as i32;
-            if left < 0 {
-                return left;
-            }
+            left = (left << 1) - count[len] as i32;
             if len < MAX_BITS {
-                offsets[len + 1] = offsets[len] + self.count[len];
+                offsets[len + 1] = offsets[len] + count[len];
             }
         }
 
+        // An over-subscribed code gets rejected before it is used; its symbols
+        // that do not fit are dropped here.
         for (sym, &len) in lengths.iter().enumerate() {
             if len != 0 {
                 let offset = &mut offsets[(len & 15) as usize];
@@ -99,20 +79,32 @@ impl Huffman<'_> {
                 *offset += 1;
             }
         }
-        left
+        self.left = left;
     }
 
-    /// Whether the code, given its `build` result, is one deflate permits:
-    /// complete, or made of a single one-bit code.
+    /// Whether the code is one deflate permits for literals/lengths and for
+    /// distances: complete, or made of a single one-bit code.
     #[cfg(feature = "dynamic")]
-    fn is_valid(&self, left: i32, symbols: usize) -> bool {
-        left == 0 || (left > 0 && symbols == (self.count[0] + self.count[1]) as usize)
+    fn is_valid(&self, symbols: usize) -> bool {
+        self.left == 0 || (self.left > 0 && symbols == (self.count[0] + self.count[1]) as usize)
     }
 }
 
-impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
+impl<'a, I: Input, O: Output, C: Checksum> Inflate<'a, I, O, C> {
+    pub(crate) fn new(input: &'a mut I, out: &'a mut O, check: C) -> Self {
+        Inflate {
+            input,
+            out,
+            check,
+            bit_buf: 0,
+            bit_cnt: 0,
+        }
+    }
+
     /// Reads `need` bits, at most 16, least significant first.
-    fn bits(&mut self, need: u32) -> Result<u32, Error> {
+    ///
+    /// The result is kept to 16 bits so that it comes back in a register.
+    pub(crate) fn bits(&mut self, need: u32) -> Result<u16, Error> {
         while self.bit_cnt < need {
             self.bit_buf |= (self.input.byte()? as u32) << self.bit_cnt;
             self.bit_cnt += 8;
@@ -120,7 +112,42 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
         let value = self.bit_buf & ((1 << need) - 1);
         self.bit_buf >>= need;
         self.bit_cnt -= need;
-        Ok(value)
+        Ok(value as u16)
+    }
+
+    /// Skips `bytes` bytes. Only valid on a byte boundary.
+    #[cfg(feature = "gzip")]
+    pub(crate) fn skip(&mut self, bytes: u16) -> Result<(), Error> {
+        for _ in 0..bytes {
+            self.bits(8)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes one raw deflate stream and flushes the output. Leaves the input
+    /// right after the stream, on a byte boundary.
+    pub(crate) fn inflate(&mut self) -> Result<(), Error> {
+        loop {
+            let last = self.bits(1)? != 0;
+            match self.bits(2)? {
+                #[cfg(feature = "stored")]
+                0 => self.stored()?,
+                #[cfg(feature = "fixed")]
+                1 => self.fixed()?,
+                #[cfg(feature = "dynamic")]
+                2 => self.dynamic()?,
+                3 => return Err(Error::InvalidBlock),
+                _ => return Err(Error::Unsupported),
+            }
+            if last {
+                break;
+            }
+        }
+        // Input is only ever fetched a byte at a time, so the bits left over
+        // are padding and nothing past the end of the stream was consumed.
+        self.bit_cnt = 0;
+        self.bit_buf = 0;
+        self.out.flush(&mut self.check)
     }
 
     #[cfg(feature = "stored")]
@@ -129,12 +156,12 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
         self.bit_buf = 0;
         self.bit_cnt = 0;
         let len = self.bits(16)?;
-        if self.bits(16)? != len ^ 0xffff {
+        if self.bits(16)? != !len {
             return Err(Error::InvalidBlock);
         }
         for _ in 0..len {
-            let byte = self.input.byte()?;
-            self.out.put(byte, self.check)?;
+            let byte = self.bits(8)? as u8;
+            self.out.put(byte, &mut self.check)?;
         }
         Ok(())
     }
@@ -169,11 +196,9 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
             lengths[(sym & 31) as usize] = self.bits(3)? as u8;
         }
         let mut symbol = [0; 19];
-        let mut code = Huffman {
-            count: [0; MAX_BITS + 1],
-            symbol: &mut symbol,
-        };
-        if code.build(&lengths[..19]) != 0 {
+        let mut code = Huffman::new(&mut symbol);
+        code.build(&lengths[..19]);
+        if code.left != 0 {
             return Err(Error::InvalidCode);
         }
 
@@ -223,29 +248,19 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
             .ok_or(Error::InvalidBlock)?;
         let mut symbol = [0; MAX_SYMS];
         let (len_symbol, dist_symbol) = symbol.split_at_mut(MAX_LEN_SYMS);
-        let mut len_code = Huffman {
-            count: [0; MAX_BITS + 1],
-            symbol: len_symbol,
-        };
-        let mut dist_code = Huffman {
-            count: [0; MAX_BITS + 1],
-            symbol: dist_symbol,
-        };
-        let len_left = len_code.build(len_lengths);
-        let dist_left = dist_code.build(dist_lengths);
+        let mut len_code = Huffman::new(len_symbol);
+        let mut dist_code = Huffman::new(dist_symbol);
+        len_code.build(len_lengths);
+        dist_code.build(dist_lengths);
         #[cfg(feature = "dynamic")]
-        if !len_code.is_valid(len_left, len_lengths.len())
-            || !dist_code.is_valid(dist_left, dist_lengths.len())
-        {
+        if !len_code.is_valid(len_lengths.len()) || !dist_code.is_valid(dist_lengths.len()) {
             return Ok(false);
         }
-        #[cfg(not(feature = "dynamic"))]
-        let _ = (len_left, dist_left);
 
         loop {
             let sym = self.decode(&len_code)? as u32;
             if sym < 256 {
-                self.out.put(sym as u8, self.check)?;
+                self.out.put(sym as u8, &mut self.check)?;
                 continue;
             }
             if sym == 256 {
@@ -259,7 +274,7 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
                 0..=3 => sym + 3,
                 4..=27 => {
                     let extra = (sym - 4) >> 2;
-                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra)?
+                    ((4 + (sym & 3)) << extra) + 3 + self.bits(extra)? as u32
                 }
                 28 => 258,
                 _ => return Err(Error::InvalidCode),
@@ -272,12 +287,13 @@ impl<I: Input, O: Output, C: Checksum> Inflate<'_, I, O, C> {
                 0..=1 => sym + 1,
                 2..=29 => {
                     let extra = (sym - 2) >> 1;
-                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra)?
+                    ((2 + (sym & 1)) << extra) + 1 + self.bits(extra)? as u32
                 }
                 _ => return Err(Error::InvalidCode),
             };
 
-            self.out.copy(dist as usize, len as usize, self.check)?;
+            self.out
+                .copy(dist as usize, len as usize, &mut self.check)?;
         }
     }
 
