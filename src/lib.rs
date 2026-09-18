@@ -32,6 +32,11 @@
 //!
 //! On top of that, decoding uses about 1.5 KiB of stack.
 //!
+//! Every path is bounded: a [`Buffer`] by its size, a [`Stream`], a
+//! [`Counter`] and the length functions by a mandatory maximum length, beyond
+//! which they fail with [`Error::OutputFull`] instead of letting a
+//! decompression bomb run. [`NO_LIMIT`] opts out.
+//!
 //! # Examples
 //!
 //! Buffer to buffer:
@@ -61,7 +66,7 @@
 //! #     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0x48, 0xcd, 0xc9, 0xc9,
 //! #     0x57, 0xc8, 0x40, 0x27, 0x01, 0xe3, 0x51, 0x3d, 0x8d, 0x17, 0x00, 0x00, 0x00,
 //! # ];
-//! assert_eq!(gunzip_len(&gz[..])?, 23);
+//! assert_eq!(gunzip_len(&gz[..], 1 << 20)?, 23);
 //!
 //! let mut source = gz.chunks(5); // stands for a UART, a flash driver, a socket...
 //! let mut scratch = [0; 16];
@@ -73,7 +78,7 @@
 //!
 //! let mut window = [0; 32768];
 //! let mut total = 0;
-//! let output = Stream::new(&mut window, |data| {
+//! let output = Stream::new(&mut window, 1 << 20, |data| {
 //!     total += data.len();
 //!     Ok(())
 //! });
@@ -119,6 +124,13 @@ pub use io::{Buffer, Bytes, Counter, Input, Output, Reader, Stream};
 
 use core::fmt;
 
+/// The maximum length to pass for no maximum at all: the `-1` of a C API.
+///
+/// Think twice. Deflate can expand a thousandfold, so without a limit whoever
+/// supplies the compressed data decides how long decoding runs and how much
+/// comes out of it.
+pub const NO_LIMIT: u64 = u64::MAX;
+
 /// Why decompression failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -138,7 +150,9 @@ pub enum Error {
     InvalidDistance,
     /// A back-reference points further back than the [`Stream`] window holds.
     WindowTooSmall,
-    /// The [`Buffer`] cannot hold the decompressed data.
+    /// The decompressed data is longer than the output allows: it does not fit
+    /// in the [`Buffer`], or exceeds the maximum length given to a [`Stream`],
+    /// a [`Counter`] or a `*_len` function.
     OutputFull,
     /// The decompressed data does not match its checksum or recorded length.
     ChecksumMismatch,
@@ -156,7 +170,7 @@ impl fmt::Display for Error {
             Error::InvalidCode => "invalid Huffman code",
             Error::InvalidDistance => "invalid back-reference distance",
             Error::WindowTooSmall => "window too small",
-            Error::OutputFull => "output buffer full",
+            Error::OutputFull => "output too long",
             Error::ChecksumMismatch => "checksum mismatch",
             Error::Io => "input/output failure",
         })
@@ -210,41 +224,45 @@ pub fn decompress<I: Input, O: Output>(mut input: I, mut output: O) -> Result<u6
 /// Returns the length a raw deflate stream decompresses to.
 ///
 /// The stream is decoded in full, but nothing is stored, so this needs no
-/// memory and is a good deal faster than decompressing.
-pub fn inflate_len<I: Input>(input: I) -> Result<u64, Error> {
-    inflate(input, Counter::new())
+/// memory and is a good deal faster than decompressing. Decoding gives up with
+/// [`Error::OutputFull`] once the length exceeds `max_len`; see [`NO_LIMIT`].
+pub fn inflate_len<I: Input>(input: I, max_len: u64) -> Result<u64, Error> {
+    inflate(input, Counter::new(max_len))
 }
 
 /// Returns the length a gzip stream decompresses to.
 ///
 /// The stream is decoded in full, but nothing is stored, so this needs no
-/// memory and is a good deal faster than decompressing. The data checksum is
+/// memory and is a good deal faster than decompressing. Decoding gives up with
+/// [`Error::OutputFull`] once the length exceeds `max_len`; see [`NO_LIMIT`]. The data checksum is
 /// not verified; the length recorded in the stream is.
 ///
 /// See [`gzip_size_hint`] for a shortcut.
 #[cfg(feature = "gzip")]
-pub fn gunzip_len<I: Input>(input: I) -> Result<u64, Error> {
-    gunzip(input, Counter::new())
+pub fn gunzip_len<I: Input>(input: I, max_len: u64) -> Result<u64, Error> {
+    gunzip(input, Counter::new(max_len))
 }
 
 /// Returns the length a zlib stream decompresses to.
 ///
 /// The stream is decoded in full, but nothing is stored, so this needs no
-/// memory and is a good deal faster than decompressing. The data checksum is
+/// memory and is a good deal faster than decompressing. Decoding gives up with
+/// [`Error::OutputFull`] once the length exceeds `max_len`; see [`NO_LIMIT`]. The data checksum is
 /// not verified.
 #[cfg(feature = "zlib")]
-pub fn unzlib_len<I: Input>(input: I) -> Result<u64, Error> {
-    unzlib(input, Counter::new())
+pub fn unzlib_len<I: Input>(input: I, max_len: u64) -> Result<u64, Error> {
+    unzlib(input, Counter::new(max_len))
 }
 
 /// Returns the length a gzip or zlib stream decompresses to.
 ///
 /// The stream is decoded in full, but nothing is stored, so this needs no
-/// memory and is a good deal faster than decompressing. The data checksum is
+/// memory and is a good deal faster than decompressing. Decoding gives up with
+/// [`Error::OutputFull`] once the length exceeds `max_len`; see [`NO_LIMIT`]. The data checksum is
 /// not verified.
 #[cfg(all(feature = "gzip", feature = "zlib"))]
-pub fn decompress_len<I: Input>(input: I) -> Result<u64, Error> {
-    decompress(input, Counter::new())
+pub fn decompress_len<I: Input>(input: I, max_len: u64) -> Result<u64, Error> {
+    decompress(input, Counter::new(max_len))
 }
 
 /// Reads the decompressed length recorded in the last four bytes of a gzip

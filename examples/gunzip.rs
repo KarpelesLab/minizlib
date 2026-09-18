@@ -7,7 +7,7 @@
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use minigunzip::{Error, Reader, Stream, decompress, decompress_len};
+use minigunzip::{Error, NO_LIMIT, Reader, Stream, decompress, decompress_len};
 
 fn main() -> ExitCode {
     let len_only = std::env::args().nth(1).as_deref() == Some("--len");
@@ -25,10 +25,10 @@ fn main() -> ExitCode {
     });
 
     let result = if len_only {
-        decompress_len(input).map(|len| println!("{len}"))
+        decompress_len(input, NO_LIMIT).map(|len| println!("{len}"))
     } else {
         let mut window = vec![0; 32768];
-        let output = Stream::new(&mut window, |data| {
+        let output = Stream::new(&mut window, NO_LIMIT, |data| {
             stdout.write_all(data).map_err(|_| Error::Io)
         });
         decompress(input, output).map(drop)

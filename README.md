@@ -34,12 +34,17 @@ let data = &out[..len];
 | output                | how                                  | memory needed            |
 |-----------------------|--------------------------------------|--------------------------|
 | buffer out            | `Buffer::new(&mut out)`              | the output buffer itself |
-| stream out (callback) | `Stream::new(&mut window, \|data\| ...)` | a window, usually 32 KiB |
-| none, just the length | `Counter::new()`                     | none                     |
+| stream out (callback) | `Stream::new(&mut window, max_len, \|data\| ...)` | a window, usually 32 KiB |
+| none, just the length | `Counter::new(max_len)`              | none                     |
 
 Every function takes any input with any output, and returns the number of
 bytes produced. Pass `&mut input` or `&mut output` to keep using them
 afterwards. Beyond the above, decoding uses about 1.5 KiB of stack.
+
+Every path is bounded, so a decompression bomb cannot run away: a `Buffer` by
+its size, a `Stream`, a `Counter` and the `*_len` functions by a mandatory
+`max_len`, past which they fail with `Error::OutputFull`. `NO_LIMIT` is the
+explicit way out, for when whatever comes really is welcome.
 
 Everything gzip can produce is supported: all three deflate block types, header
 name / comment / extra fields, and concatenated members.
@@ -53,7 +58,7 @@ let mut scratch = [0; 64];
 let input = Reader::new(&mut scratch, |buf| uart.read(buf).map_err(|_| Error::Io));
 
 let mut window = [0; 32768];
-let output = Stream::new(&mut window, |data| flash.write(data).map_err(|_| Error::Io));
+let output = Stream::new(&mut window, PARTITION_SIZE, |data| flash.write(data).map_err(|_| Error::Io));
 
 gunzip(input, output)?;
 ```
@@ -66,7 +71,8 @@ one look-ahead byte the `concat` feature needs.
 
 ### Finding the decompressed length
 
-`gunzip_len` and friends decode the stream without storing anything. A
+`gunzip_len(input, max_len)` and friends decode the stream without storing
+anything. A
 back-reference has a known length whatever it points at, so no window and no
 output buffer are needed, and it runs two to three times faster than
 decompressing. The data checksum cannot be verified this way; the structure of
@@ -116,8 +122,8 @@ table, and CI runs it to keep the no-panic guarantee honest.
 | gzip, `dynamic` blocks only                     |  2157 |
 | gzip, `fixed` blocks only                       |  1716 |
 | gzip, `stored` blocks only                      |   710 |
-| stream in / stream out, default features        |  3160 |
-| length only, default features                   |  2781 |
+| stream in / stream out, default features        |  3186 |
+| length only, default features                   |  2849 |
 
 About 600 of those bytes are the `memset` / `memclr` routines of
 `compiler_builtins`, which most firmware links anyway. No configuration links

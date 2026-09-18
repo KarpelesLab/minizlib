@@ -108,6 +108,7 @@ fn to_stream<I: Input>(
     };
     let mut stream = Stream::new(
         &mut window,
+        NO_LIMIT,
         &mut sink as &mut dyn FnMut(&[u8]) -> Result<(), Error>,
     );
     let written = f(input, &mut stream)?;
@@ -207,16 +208,28 @@ fn round_trips() {
             );
 
             // Lengths.
-            assert_eq!(gunzip_len(&gz[..]).unwrap(), data.len() as u64, "{what}");
-            assert_eq!(unzlib_len(&zl[..]).unwrap(), data.len() as u64, "{what}");
-            assert_eq!(inflate_len(&raw[..]).unwrap(), data.len() as u64, "{what}");
             assert_eq!(
-                decompress_len(&gz[..]).unwrap(),
+                gunzip_len(&gz[..], NO_LIMIT).unwrap(),
                 data.len() as u64,
                 "{what}"
             );
             assert_eq!(
-                decompress_len(Bytes(zl.iter().copied())).unwrap(),
+                unzlib_len(&zl[..], NO_LIMIT).unwrap(),
+                data.len() as u64,
+                "{what}"
+            );
+            assert_eq!(
+                inflate_len(&raw[..], NO_LIMIT).unwrap(),
+                data.len() as u64,
+                "{what}"
+            );
+            assert_eq!(
+                decompress_len(&gz[..], NO_LIMIT).unwrap(),
+                data.len() as u64,
+                "{what}"
+            );
+            assert_eq!(
+                decompress_len(Bytes(zl.iter().copied()), NO_LIMIT).unwrap(),
                 data.len() as u64,
                 "{what}"
             );
@@ -247,7 +260,7 @@ fn fixed_block_from_zlib() {
         to_stream(|i, o| inflate(i, o), &raw[..], 32_768).unwrap(),
         text
     );
-    assert_eq!(inflate_len(&raw[..]).unwrap(), text.len() as u64);
+    assert_eq!(inflate_len(&raw[..], NO_LIMIT).unwrap(), text.len() as u64);
 }
 
 #[test]
@@ -277,7 +290,7 @@ fn gzip_header_fields() {
 
     gz[3] |= 0x20;
     assert_eq!(
-        gunzip_len(&gz[..]),
+        gunzip_len(&gz[..], NO_LIMIT),
         Err(Error::InvalidHeader),
         "reserved flag"
     );
@@ -297,7 +310,7 @@ fn gzip_members() {
         to_stream(|i, o| gunzip(i, o), &gz[..], 32_768).unwrap(),
         b"first,second,third"
     );
-    assert_eq!(gunzip_len(&gz[..]).unwrap(), 18);
+    assert_eq!(gunzip_len(&gz[..], NO_LIMIT).unwrap(), 18);
     assert_eq!(
         gzip_size_hint(&gz),
         Some(5),
@@ -306,10 +319,10 @@ fn gzip_members() {
 
     // Trailing padding is ignored, a trailing broken member is not.
     gz.extend([0; 7]);
-    assert_eq!(gunzip_len(&gz[..]).unwrap(), 18);
+    assert_eq!(gunzip_len(&gz[..], NO_LIMIT).unwrap(), 18);
     gz.extend([0x1f, 0x8c]);
     gz.drain(gz.len() - 9..gz.len() - 2);
-    assert_eq!(gunzip_len(&gz[..]), Err(Error::InvalidHeader));
+    assert_eq!(gunzip_len(&gz[..], NO_LIMIT), Err(Error::InvalidHeader));
 }
 
 #[test]
@@ -340,20 +353,20 @@ fn input_is_left_after_the_stream() {
     let len = data.len();
     data.extend(b"what follows");
     let mut input = &data[..];
-    assert_eq!(unzlib_len(&mut input).unwrap(), 9);
+    assert_eq!(unzlib_len(&mut input, NO_LIMIT).unwrap(), 9);
     assert_eq!(input, b"what follows");
 
     let mut scratch = [0; 8];
     let mut rng = Rng(3);
     let mut reader = Reader::new(&mut scratch, chunked(&data, &mut rng));
-    assert_eq!(unzlib_len(&mut reader).unwrap(), 9);
+    assert_eq!(unzlib_len(&mut reader, NO_LIMIT).unwrap(), 9);
     assert!(data[len..].starts_with(reader.buffered()));
 
     // Looking for another gzip member takes one more byte.
     let mut data = gzip(b"some data", 6);
     data.extend(b"what follows");
     let mut input = &data[..];
-    assert_eq!(gunzip_len(&mut input).unwrap(), 9);
+    assert_eq!(gunzip_len(&mut input, NO_LIMIT).unwrap(), 9);
     assert_eq!(input, b"hat follows");
 }
 
@@ -411,7 +424,7 @@ fn errors() {
         } else {
             Ok(len as u64)
         };
-        assert_eq!(gunzip_len(&bad[..]), expected);
+        assert_eq!(gunzip_len(&bad[..], NO_LIMIT), expected);
     }
     let mut bad = zl.clone();
     *bad.last_mut().unwrap() ^= 1;
@@ -427,20 +440,35 @@ fn errors() {
     // Compression method, preset dictionary, window size.
     let mut bad = gz.clone();
     bad[2] = 7;
-    assert_eq!(gunzip_len(&bad[..]), Err(Error::Unsupported));
-    assert_eq!(unzlib_len(&[0x78, 0xbb][..]), Err(Error::Unsupported));
-    assert_eq!(unzlib_len(&[0x88, 0x1c][..]), Err(Error::Unsupported));
-    assert_eq!(unzlib_len(&[0x78, 0x9d][..]), Err(Error::InvalidHeader));
+    assert_eq!(gunzip_len(&bad[..], NO_LIMIT), Err(Error::Unsupported));
+    assert_eq!(
+        unzlib_len(&[0x78, 0xbb][..], NO_LIMIT),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        unzlib_len(&[0x88, 0x1c][..], NO_LIMIT),
+        Err(Error::Unsupported)
+    );
+    assert_eq!(
+        unzlib_len(&[0x78, 0x9d][..], NO_LIMIT),
+        Err(Error::InvalidHeader)
+    );
 
     // Block type 3, and a stored block whose length check fails.
-    assert_eq!(inflate_len(&[0b111][..]), Err(Error::InvalidBlock));
     assert_eq!(
-        inflate_len(&[1, 5, 0, 0xfa, 0xfe][..]),
+        inflate_len(&[0b111][..], NO_LIMIT),
+        Err(Error::InvalidBlock)
+    );
+    assert_eq!(
+        inflate_len(&[1, 5, 0, 0xfa, 0xfe][..], NO_LIMIT),
         Err(Error::InvalidBlock)
     );
     // A fixed block starting with a match, which has nothing to refer to.
     let lone_match = [0b0000_0011, 0b0000_0010, 0];
-    assert_eq!(inflate_len(&lone_match[..]), Err(Error::InvalidDistance));
+    assert_eq!(
+        inflate_len(&lone_match[..], NO_LIMIT),
+        Err(Error::InvalidDistance)
+    );
     assert_eq!(
         to_buffer(|i, o| inflate(i, o), &lone_match, 9),
         Err(Error::InvalidDistance)
@@ -453,14 +481,14 @@ fn errors() {
     // Callback failures come back as they are.
     let mut scratch = [0; 8];
     let reader = Reader::new(&mut scratch, |_| Err(Error::Io));
-    assert_eq!(gunzip_len(reader), Err(Error::Io));
+    assert_eq!(gunzip_len(reader, NO_LIMIT), Err(Error::Io));
     let reader = Reader::new(&mut scratch, |buf| {
         buf.copy_from_slice(&gz[..buf.len()]);
         Ok(buf.len() + 1)
     });
-    assert_eq!(gunzip_len(reader), Err(Error::Io));
+    assert_eq!(gunzip_len(reader, NO_LIMIT), Err(Error::Io));
     let mut window = [0; 1000];
-    let stream = Stream::new(&mut window, |_| Err(Error::Io));
+    let stream = Stream::new(&mut window, NO_LIMIT, |_| Err(Error::Io));
     assert_eq!(gunzip(&gz[..], stream), Err(Error::Io));
 }
 
@@ -496,7 +524,7 @@ fn truncation() {
         let gz = gzip(&data, level);
         for len in 0..gz.len() {
             assert_eq!(
-                gunzip_len(&gz[..len]),
+                gunzip_len(&gz[..len], NO_LIMIT),
                 Err(Error::UnexpectedEof),
                 "{len} of {}",
                 gz.len()
@@ -536,7 +564,7 @@ fn corruption() {
         let mut streamed_len = 0;
         let streamed = decompress(
             &bad[..],
-            Stream::new(&mut window, |data| {
+            Stream::new(&mut window, NO_LIMIT, |data| {
                 streamed_len += data.len();
                 Ok(())
             }),
@@ -547,7 +575,11 @@ fn corruption() {
             assert_eq!(len, streamed_len as u64);
         }
         if buffered.is_ok() {
-            assert_eq!(decompress_len(&bad[..]), buffered, "round {round}");
+            assert_eq!(
+                decompress_len(&bad[..], NO_LIMIT),
+                buffered,
+                "round {round}"
+            );
         }
         failures += buffered.is_err() as usize;
     }
@@ -558,7 +590,69 @@ fn corruption() {
         let noise: Vec<u8> = (0..1 + rng.below(200)).map(|_| rng.next() as u8).collect();
         let buffered = inflate(&noise[..], Buffer::new(&mut out));
         if let Ok(len) = buffered {
-            assert_eq!(inflate_len(&noise[..]), Ok(len));
+            assert_eq!(inflate_len(&noise[..], NO_LIMIT), Ok(len));
         }
     }
+}
+
+/// A `Stream`, a `Counter` and the length functions stop at their maximum
+/// length, exactly.
+#[test]
+fn max_len() {
+    let mut rng = Rng(8);
+    let data: Vec<u8> = (0..70_000).map(|_| b"abcdefgh"[rng.below(8)]).collect();
+    let len = data.len() as u64;
+    let stream_to = |input: &[u8], max_len: u64| {
+        let mut out = Vec::new();
+        let mut window = vec![0; 32_768];
+        let result = decompress(
+            input,
+            Stream::new(&mut window, max_len, |chunk| {
+                out.extend_from_slice(chunk);
+                Ok(())
+            }),
+        );
+        (result, out)
+    };
+
+    for level in [0, 1, 9] {
+        for input in [gzip(&data, level), zlib(&data, level)] {
+            for max_len in [NO_LIMIT, len + 1, len] {
+                assert_eq!(decompress_len(&input[..], max_len), Ok(len));
+                assert_eq!(stream_to(&input, max_len), (Ok(len), data.clone()));
+            }
+            for max_len in [len - 1, 40_000, 32_768, 1, 0] {
+                assert_eq!(decompress_len(&input[..], max_len), Err(Error::OutputFull));
+                // Nothing past the limit reaches the callback.
+                let (result, out) = stream_to(&input, max_len);
+                assert_eq!(result, Err(Error::OutputFull));
+                assert!(out.len() as u64 <= max_len);
+                assert!(data.starts_with(&out));
+            }
+        }
+    }
+
+    // Empty streams fit in no space at all.
+    assert_eq!(gunzip_len(&gzip(b"", 6)[..], 0), Ok(0));
+    assert_eq!(stream_to(&gzip(b"", 6), 0), (Ok(0), vec![]));
+
+    // The limit of a lent output covers everything it receives.
+    let mut counter = Counter::new(10);
+    assert_eq!(gunzip(&gzip(b"123456", 6)[..], &mut counter), Ok(6));
+    assert_eq!(
+        gunzip(&gzip(b"78901", 6)[..], &mut counter),
+        Err(Error::OutputFull)
+    );
+
+    // A decompression bomb: 1 GiB of zeros. Stopped right away, and countable
+    // for who insists.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::best());
+    for _ in 0..1024 {
+        encoder.write_all(&[0; 1 << 20]).unwrap();
+    }
+    let bomb = encoder.finish().unwrap();
+    assert!(bomb.len() < 2 << 20);
+    assert_eq!(gunzip_len(&bomb[..], 1 << 20), Err(Error::OutputFull));
+    assert_eq!(stream_to(&bomb, 1 << 20).0, Err(Error::OutputFull));
+    assert_eq!(gunzip_len(&bomb[..], NO_LIMIT), Ok(1 << 30));
 }

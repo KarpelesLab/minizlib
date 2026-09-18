@@ -26,11 +26,12 @@ pub extern "C" fn entry(
     write: extern "C" fn(*const u8, usize),
     window: *mut u8,
     window_len: usize,
+    max_len: u64,
 ) -> i64 {
     let window = unsafe { core::slice::from_raw_parts_mut(window, window_len) };
     let mut scratch = [0; 64];
     let input = Reader::new(&mut scratch, |buf| Ok(read(buf.as_mut_ptr(), buf.len())));
-    let output = Stream::new(window, |data| {
+    let output = Stream::new(window, max_len, |data| {
         write(data.as_ptr(), data.len());
         Ok(())
     });
@@ -40,7 +41,7 @@ pub extern "C" fn entry(
 /// Length only.
 #[cfg(feature = "len")]
 #[unsafe(no_mangle)]
-pub extern "C" fn entry(src: *const u8, src_len: usize) -> i64 {
+pub extern "C" fn entry(src: *const u8, src_len: usize, max_len: u64) -> i64 {
     let src = unsafe { core::slice::from_raw_parts(src, src_len) };
-    gunzip_len(src).map_or(-1, |len| len as i64)
+    gunzip_len(src, max_len).map_or(-1, |len| len as i64)
 }

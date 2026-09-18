@@ -210,22 +210,31 @@ impl Output for Buffer<'_> {
 /// handles every deflate stream; a larger window only means fewer, larger
 /// callback invocations. The callback may fail with any [`Error`], typically
 /// [`Error::Io`].
+///
+/// Nothing else bounds how much a stream decompresses to, and a few kilobytes
+/// of deflate can expand to gigabytes, so a maximum length is required:
+/// decompression fails with [`Error::OutputFull`] rather than produce more
+/// than `max_len` bytes. Pass [`NO_LIMIT`](crate::NO_LIMIT) if the callback can
+/// really take whatever comes.
 pub struct Stream<'w, F> {
     window: &'w mut [u8],
     pos: usize,
     sent: usize,
     total: u64,
+    max_len: u64,
     sink: F,
 }
 
 impl<'w, F: FnMut(&[u8]) -> Result<(), Error>> Stream<'w, F> {
-    /// Creates an output using `window` as its history window.
-    pub fn new(window: &'w mut [u8], sink: F) -> Self {
+    /// Creates an output using `window` as its history window, accepting at
+    /// most `max_len` bytes.
+    pub fn new(window: &'w mut [u8], max_len: u64, sink: F) -> Self {
         Stream {
             window,
             pos: 0,
             sent: 0,
             total: 0,
+            max_len,
             sink,
         }
     }
@@ -245,6 +254,9 @@ impl<'w, F: FnMut(&[u8]) -> Result<(), Error>> Stream<'w, F> {
 impl<F: FnMut(&[u8]) -> Result<(), Error>> Output for Stream<'_, F> {
     #[inline]
     fn put<C: Checksum>(&mut self, byte: u8, check: &mut C) -> Result<(), Error> {
+        if self.total >= self.max_len {
+            return Err(Error::OutputFull);
+        }
         *self.window.get_mut(self.pos).ok_or(Error::WindowTooSmall)? = byte;
         self.pos += 1;
         self.total += 1;
@@ -293,13 +305,20 @@ impl<F: FnMut(&[u8]) -> Result<(), Error>> Output for Stream<'_, F> {
 /// back-reference has a known length whatever it points at.
 ///
 /// Data checksums cannot be verified this way; everything else still is.
-#[derive(Default)]
-pub struct Counter(u64);
+///
+/// Counting is fast, but a few kilobytes of deflate can still stand for
+/// gigabytes of data, so a maximum length is required: decoding fails with
+/// [`Error::OutputFull`] as soon as the count exceeds `max_len`. Pass
+/// [`NO_LIMIT`](crate::NO_LIMIT) to count no matter what.
+pub struct Counter {
+    count: u64,
+    max_len: u64,
+}
 
 impl Counter {
-    /// Creates a counter starting at zero.
-    pub fn new() -> Self {
-        Counter(0)
+    /// Creates a counter starting at zero and giving up past `max_len`.
+    pub fn new(max_len: u64) -> Self {
+        Counter { count: 0, max_len }
     }
 }
 
@@ -307,17 +326,20 @@ impl Output for Counter {
     const VERIFY: bool = false;
 
     #[inline]
-    fn put<C: Checksum>(&mut self, _: u8, _: &mut C) -> Result<(), Error> {
-        self.0 += 1;
-        Ok(())
+    fn put<C: Checksum>(&mut self, _: u8, check: &mut C) -> Result<(), Error> {
+        self.copy(0, 1, check)
     }
 
     #[inline]
     fn copy<C: Checksum>(&mut self, dist: usize, len: usize, _: &mut C) -> Result<(), Error> {
-        if dist as u64 > self.0 {
+        if dist as u64 > self.count {
             return Err(Error::InvalidDistance);
         }
-        self.0 += len as u64;
+        // `count` never exceeds `max_len`, so this cannot overflow.
+        if len as u64 > self.max_len - self.count {
+            return Err(Error::OutputFull);
+        }
+        self.count += len as u64;
         Ok(())
     }
 
@@ -326,7 +348,7 @@ impl Output for Counter {
     }
 
     fn written(&self) -> u64 {
-        self.0
+        self.count
     }
 }
 
