@@ -1,0 +1,5 @@
+[workspace]
+# Only publish when a release PR gets merged, never on a plain push to master.
+# Without this, release-plz publishes whenever the version in Cargo.toml is not
+# on crates.io yet, which includes the very first push of this workflow.
+release_always = false

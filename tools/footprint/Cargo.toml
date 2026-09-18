@@ -1,0 +1,21 @@
+# Bare-metal binary exercising minigunzip, to measure its code size and to
+# prove that no panic machinery gets linked. See check.sh.
+[package]
+name = "footprint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[features]
+buffer = []
+stream = []
+len = []
+
+[dependencies]
+minigunzip = { path = "../..", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

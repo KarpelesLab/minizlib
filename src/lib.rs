@@ -3,12 +3,19 @@
 //!
 //! Pick a format, an input and an output, and go:
 //!
-//! | format                   | function       | length only        |
-//! |--------------------------|----------------|--------------------|
-//! | gzip (RFC 1952)          | [`gunzip`]     | [`gunzip_len`]     |
-//! | zlib (RFC 1950)          | [`unzlib`]     | [`unzlib_len`]     |
-//! | raw deflate (RFC 1951)   | [`inflate`]    | [`inflate_len`]    |
-//! | gzip or zlib, detected   | [`decompress`] | [`decompress_len`] |
+//! | format                 | function          | length only            |
+//! |------------------------|-------------------|------------------------|
+//! | gzip (RFC 1952)        | [`gunzip`][g]     | [`gunzip_len`][gl]     |
+//! | zlib (RFC 1950)        | [`unzlib`][z]     | [`unzlib_len`][zl]     |
+//! | raw deflate (RFC 1951) | [`inflate`]       | [`inflate_len`]        |
+//! | gzip or zlib, detected | [`decompress`][d] | [`decompress_len`][dl] |
+//!
+//! [g]: fn.gunzip.html
+//! [gl]: fn.gunzip_len.html
+//! [z]: fn.unzlib.html
+//! [zl]: fn.unzlib_len.html
+//! [d]: fn.decompress.html
+//! [dl]: fn.decompress_len.html
 //!
 //! | input                | how                           |
 //! |----------------------|-------------------------------|

@@ -9,6 +9,7 @@ readme = "README.md"
 repository = "https://github.com/KarpelesLab/minigunzip"
 keywords = ["gzip", "zlib", "deflate", "inflate", "no_std"]
 categories = ["compression", "no-std", "no-std::no-alloc", "embedded"]
+exclude = [".github", "tools", "release-plz.toml"]
 
 [features]
 default = ["gzip", "zlib", "checksum", "concat", "stored", "fixed", "dynamic"]
@@ -28,6 +29,10 @@ concat = []
 stored = []
 fixed = []
 dynamic = []
+
+[[example]]
+name = "gunzip"
+required-features = ["gzip", "zlib"]
 
 [dev-dependencies]
 flate2 = "1"

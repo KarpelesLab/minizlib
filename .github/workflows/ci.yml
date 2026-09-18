@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
+        run: cargo fmt --all --check
+
+      - name: Clippy (all features, warnings denied)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The two runs differ by `crc-table`, i.e. by CRC-32 implementation.
+      # Release mode: the suite decodes a few hundred megabytes.
+      - name: Test (default features)
+        run: cargo test --release
+
+      - name: Test (all features)
+        run: cargo test --release --all-features
+
+  no_std:
+    name: no_std builds (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # thumbv7em-none-eabi is a 32-bit bare-metal target: it catches both
+        # accidental `std` dependencies and 64-bit-only arithmetic.
+        target: [x86_64-unknown-linux-gnu, thumbv7em-none-eabi]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build with default features
+        run: cargo build --target ${{ matrix.target }}
+
+      - name: Build with all features
+        run: cargo build --target ${{ matrix.target }} --all-features
+
+      - name: Build the bare minimum
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features stored
+
+  footprint:
+    # Guards the README's claims: builds a bare-metal binary around the crate
+    # in a range of configurations, and fails if any of them links panic
+    # machinery or needs static RAM. The sizes land in the job summary.
+    name: Footprint (no panics, code size)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+          components: llvm-tools
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/footprint
+
+      - name: Measure
+        run: tools/footprint/check.sh | tee -a "$GITHUB_STEP_SUMMARY"
+
+  msrv:
+    name: MSRV (Rust 1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Keep this pin in sync with `rust-version` in Cargo.toml. Compiling on
+      # the declared minimum guards against accidentally using a library or
+      # language feature newer than 1.89 (behavior itself is covered by the
+      # stable `test` jobs, so this is compile-only).
+      - name: Install Rust 1.89 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.89
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: cargo check --all-features --all-targets
+        run: cargo check --all-features --all-targets
+
+  docs:
+    name: Docs build (warnings denied)
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo doc --no-deps --all-features
+        run: cargo doc --no-deps --all-features
+
+  lean_features:
+    # Every other clippy/doc run here enables nearly everything, which hides a
+    # whole class of breakage: code, tests or intra-doc links that only hold up
+    # when some other feature happens to be on. Check-only, so it is cheap.
+    name: Lean feature checks
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lean
+
+      # At least one block type is mandatory, so each set carries one. Keep in
+      # sync with Cargo.toml's [features] when adding a feature.
+      - name: clippy + rustdoc, one feature set at a time
+        run: |
+          set -euo pipefail
+          for f in stored fixed dynamic \
+                   gzip,stored zlib,stored gzip,zlib,stored \
+                   gzip,checksum,stored zlib,checksum,stored \
+                   gzip,checksum,crc-table,stored gzip,concat,stored \
+                   gzip,zlib,checksum,concat,fixed,dynamic; do
+            echo "::group::$f"
+            cargo clippy --no-default-features --features "$f" --all-targets -- -D warnings
+            cargo doc --no-deps --no-default-features --features "$f"
+            echo "::endgroup::"
+          done

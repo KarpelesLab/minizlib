@@ -104,19 +104,20 @@ compressor.
 
 Code size of a function gunzipping one slice into another, everything it needs
 included, on `thumbv7em-none-eabi` with `opt-level = "z"` and LTO (rustc 1.98).
-No RAM is used besides the stack.
+No RAM is used besides the stack. `tools/footprint/check.sh` reproduces the
+table, and CI runs it to keep the no-panic guarantee honest.
 
 | configuration                                   | bytes |
 |-------------------------------------------------|------:|
-| gzip, default features                          |  2888 |
-| … with `crc-table`                              |  3838 |
-| … without `concat`                              |  2690 |
-| … without `concat` and `checksum`               |  2551 |
-| gzip, `dynamic` blocks only                     |  2149 |
-| gzip, `fixed` blocks only                       |  1708 |
-| gzip, `stored` blocks only                      |   702 |
-| stream in / stream out, default features        |  3152 |
-| length only, default features                   |  2773 |
+| gzip, default features                          |  2896 |
+| … with `crc-table`                              |  3846 |
+| … without `concat`                              |  2698 |
+| … without `concat` and `checksum`               |  2559 |
+| gzip, `dynamic` blocks only                     |  2157 |
+| gzip, `fixed` blocks only                       |  1716 |
+| gzip, `stored` blocks only                      |   710 |
+| stream in / stream out, default features        |  3160 |
+| length only, default features                   |  2781 |
 
 About 600 of those bytes are the `memset` / `memclr` routines of
 `compiler_builtins`, which most firmware links anyway. No configuration links

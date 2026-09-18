@@ -1,0 +1,46 @@
+#![no_std]
+#![no_main]
+
+#[allow(unused_imports)]
+use minigunzip::*;
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+
+/// Buffer in, buffer out.
+#[cfg(feature = "buffer")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(src: *const u8, src_len: usize, dst: *mut u8, dst_len: usize) -> i64 {
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    let dst = unsafe { core::slice::from_raw_parts_mut(dst, dst_len) };
+    gunzip(src, Buffer::new(dst)).map_or(-1, |len| len as i64)
+}
+
+/// Stream in, stream out.
+#[cfg(feature = "stream")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(
+    read: extern "C" fn(*mut u8, usize) -> usize,
+    write: extern "C" fn(*const u8, usize),
+    window: *mut u8,
+    window_len: usize,
+) -> i64 {
+    let window = unsafe { core::slice::from_raw_parts_mut(window, window_len) };
+    let mut scratch = [0; 64];
+    let input = Reader::new(&mut scratch, |buf| Ok(read(buf.as_mut_ptr(), buf.len())));
+    let output = Stream::new(window, |data| {
+        write(data.as_ptr(), data.len());
+        Ok(())
+    });
+    gunzip(input, output).map_or(-1, |len| len as i64)
+}
+
+/// Length only.
+#[cfg(feature = "len")]
+#[unsafe(no_mangle)]
+pub extern "C" fn entry(src: *const u8, src_len: usize) -> i64 {
+    let src = unsafe { core::slice::from_raw_parts(src, src_len) };
+    gunzip_len(src).map_or(-1, |len| len as i64)
+}
