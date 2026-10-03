@@ -46,7 +46,7 @@ mod crc32 {
     pub(crate) struct Crc32(u32);
 
     impl Crc32 {
-        pub(crate) fn new() -> Self {
+        pub(crate) const fn new() -> Self {
             Crc32(!0)
         }
 
@@ -83,7 +83,7 @@ pub(crate) struct Adler32 {
 
 #[cfg(feature = "zlib")]
 impl Adler32 {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Adler32 { a: 1, b: 0 }
     }
 

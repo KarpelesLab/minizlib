@@ -133,7 +133,9 @@ length. `gzip`, `zlib` and `deflate` are a `Compressor` given a single chunk.
 
 The table is yours: any number of `u16`, of which the largest power of two gets
 used. It need not be cleared, as what it holds is checked against the data. An
-empty one still gets the Huffman coding done. On 8.7 MB of source code:
+empty one still gets the Huffman coding done. It can be borrowed, `&mut table`,
+or owned, `[0u16; 4096]` or anything else that is `AsMut<[u16]>`, for a
+compressor that is self-contained. On 8.7 MB of source code:
 
 | table                     | compressed |
 |---------------------------|-----------:|
@@ -159,6 +161,14 @@ pushed at once is compressed from where it is, without a copy.
 The price of the small code is the ratio: fixed Huffman codes and no lazy
 matching. Entering the positions that a match skips into the table would gain
 4 % for 100 bytes of code and a third more time; it was left out.
+
+### Embedding the codecs in something else
+
+`Decompressor` and `Compressor` hand their output back through `output()` and
+`output_mut()`, for an `Output` of your own to be drained between pieces. Both
+can be built as constants, `Decompressor::new_with(output, Gzip::new())` and
+`Compressor::new_with(output, Gzip::new(), [0u16; 4096])`, so one holding a
+32 KiB window or its table can live in a `static` and never transit the stack.
 
 ### Finding the decompressed length
 
@@ -220,12 +230,12 @@ table, and CI runs it to keep the no-panic guarantee honest.
 | gzip, `stored` blocks only                      |   518 |
 | stream in / stream out, default features        |  2758 |
 | length only, default features                   |  2294 |
-| pushed in, buffer out, default features         |  3454 |
-| … without `concat` and `checksum`               |  3084 |
-| … `fixed` blocks only                           |  2190 |
-| **compression**: gzip, buffer in, buffer out    |  1028 |
-| **compression**: gzip, stream in, stream out    |  1348 |
-| **compression**: gzip, pushed in, stream out    |  1538 |
+| pushed in, buffer out, default features         |  3434 |
+| … without `concat` and `checksum`               |  3088 |
+| … `fixed` blocks only                           |  2198 |
+| **compression**: gzip, buffer in, buffer out    |  1040 |
+| **compression**: gzip, stream in, stream out    |  1372 |
+| **compression**: gzip, pushed in, stream out    |  1578 |
 
 About 400 of the decompressor's bytes are the `memset` / `memclr` routines of
 `compiler_builtins`, which most firmware links anyway; the compressor needs

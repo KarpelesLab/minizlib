@@ -52,11 +52,26 @@ impl Checksum for Gzip {
 }
 
 #[cfg(feature = "gzip")]
+impl Gzip {
+    /// A fresh gzip container, for the `const` constructors that take one.
+    pub const fn new() -> Self {
+        Gzip(Crc32::new())
+    }
+}
+
+#[cfg(feature = "gzip")]
+impl Default for Gzip {
+    fn default() -> Self {
+        Gzip::new()
+    }
+}
+
+#[cfg(feature = "gzip")]
 impl Container for Gzip {
     const TRAILER: usize = 2;
 
     fn new() -> Self {
-        Gzip(Crc32::new())
+        Gzip::new()
     }
 
     fn detect(&mut self, _: u8) -> bool {
@@ -89,11 +104,26 @@ impl Checksum for Zlib {
 }
 
 #[cfg(feature = "zlib")]
+impl Zlib {
+    /// A fresh zlib container, for the `const` constructors that take one.
+    pub const fn new() -> Self {
+        Zlib(Adler32::new())
+    }
+}
+
+#[cfg(feature = "zlib")]
+impl Default for Zlib {
+    fn default() -> Self {
+        Zlib::new()
+    }
+}
+
+#[cfg(feature = "zlib")]
 impl Container for Zlib {
     const TRAILER: usize = 1;
 
     fn new() -> Self {
-        Zlib(Adler32::new())
+        Zlib::new()
     }
 
     fn detect(&mut self, _: u8) -> bool {
@@ -122,11 +152,24 @@ impl Checksum for Raw {
     fn update(&mut self, _: &[u8]) {}
 }
 
+impl Raw {
+    /// A fresh raw container, for the `const` constructors that take one.
+    pub const fn new() -> Self {
+        Raw
+    }
+}
+
+impl Default for Raw {
+    fn default() -> Self {
+        Raw::new()
+    }
+}
+
 impl Container for Raw {
     const TRAILER: usize = 0;
 
     fn new() -> Self {
-        Raw
+        Raw::new()
     }
 
     fn detect(&mut self, _: u8) -> bool {
@@ -164,15 +207,31 @@ impl Checksum for Detect {
 }
 
 #[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
-impl Container for Detect {
-    const TRAILER: usize = 2;
-
-    fn new() -> Self {
+impl Detect {
+    /// A fresh container of either kind, for the `const` constructors that
+    /// take one.
+    pub const fn new() -> Self {
         Detect {
             gzip: Gzip::new(),
             zlib: Zlib::new(),
             is_gzip: false,
         }
+    }
+}
+
+#[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
+impl Default for Detect {
+    fn default() -> Self {
+        Detect::new()
+    }
+}
+
+#[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
+impl Container for Detect {
+    const TRAILER: usize = 2;
+
+    fn new() -> Self {
+        Detect::new()
     }
 
     fn detect(&mut self, first: u8) -> bool {

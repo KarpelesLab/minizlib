@@ -146,10 +146,21 @@ impl<O: Output, F: Container> Decompressor<O, F> {
     /// would have it copied, and drag `memcpy` in.
     #[inline(always)]
     pub fn new(output: O) -> Self {
+        Self::new_with(output, F::new())
+    }
+
+    /// Starts decompressing a stream, given its container: `Gzip::new()`,
+    /// `Zlib::new()`, `Raw::new()` or `Detect::new()`.
+    ///
+    /// This is [`new`](Self::new) as a `const fn`, so a decompressor can be
+    /// built in a `static` and never transit the stack, which matters once
+    /// its output holds a 32 KiB window.
+    #[inline(always)]
+    pub const fn new_with(output: O, format: F) -> Self {
         Decompressor {
-            begin: output.written(),
+            begin: 0,
             out: output,
-            format: F::new(),
+            format,
             state: State::Start,
             context: Context {
                 bit_buf: 0,
@@ -169,6 +180,18 @@ impl<O: Output, F: Container> Decompressor<O, F> {
                 tables: Tables::new(),
             },
         }
+    }
+
+    /// The output the decompressed data goes to.
+    pub fn output(&self) -> &O {
+        &self.out
+    }
+
+    /// The output the decompressed data goes to, to take what it holds or
+    /// move it along. The decompressor only relies on its
+    /// [`written`](Output::written) count never going backwards.
+    pub fn output_mut(&mut self) -> &mut O {
+        &mut self.out
     }
 
     /// Decompresses the next piece of the stream, of any length, as far as it
@@ -219,6 +242,12 @@ impl<O: Output, F: Container> Decompressor<O, F> {
 
     /// Takes steps until the input or the stream runs out.
     fn run(&mut self, input: &mut &[u8]) -> Result<(), Error> {
+        if matches!(self.state, State::Start) {
+            // Where the output is as the stream starts, for `finish` to
+            // measure the stream by. Taken here rather than in `new_with`,
+            // which is `const` and cannot ask.
+            self.begin = self.out.written();
+        }
         let context = &mut self.context;
         let mut inflate = Inflate {
             input,

@@ -7,6 +7,8 @@
 //! reach; what it cannot tell, such as a stale or never written entry, is
 //! caught by comparing the data, which has to be done anyway.
 
+use core::marker::PhantomData;
+
 use crate::{Error, Format, Output};
 
 const MIN_MATCH: usize = 3;
@@ -31,50 +33,74 @@ fn log2(value: u32) -> u32 {
 /// [`Stream`](crate::Stream), whose window then is a mere buffer, of any size,
 /// or a [`Counter`](crate::Counter) to only find out how long it would be.
 ///
-/// `table` is the memory matches get found with. Any number of entries will
-/// do, of which the largest power of two, up to 65536, gets used; it need not
-/// be cleared. The more the better, to a point: 4096 entries (8 KiB) is a good
-/// deal, and an empty table still gets the Huffman coding done.
+/// `table` is the memory matches get found with: any number of `u16`, of
+/// which the largest power of two, up to 65536, gets used; it need not be
+/// cleared. The more the better, to a point: 4096 entries (8 KiB) is a good
+/// deal, and an empty table still gets the Huffman coding done. It is
+/// borrowed, `&mut [u16]`, or owned, `[u16; N]` or anything else that is
+/// `AsMut<[u16]>`, so a compressor can be self-contained.
 ///
 /// Matches are only looked for within a chunk, so larger chunks compress
 /// better, until they reach a few times deflate's 32 KiB reach. Each chunk
 /// also costs ten bits. When the chunks are not yours to choose, a
 /// [`BufferedCompressor`] gathers them.
-pub struct Compressor<'t, O, F> {
+pub struct Compressor<'t, O, F, T = &'t mut [u16]> {
     out: O,
     format: F,
     /// What is left to write of the header.
     header: &'static [u8],
-    table: &'t mut [u16],
-    mask: usize,
+    table: T,
+    /// Where the output was when the stream started, once `started`.
     start: u64,
+    started: bool,
     size: u32,
     bit_buf: u32,
     bit_cnt: u32,
+    /// The lifetime of the table, for a borrowed one.
+    _table: PhantomData<&'t mut [u16]>,
 }
 
-impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
+impl<'t, O: Output, F: Format, T: AsMut<[u16]>> Compressor<'t, O, F, T> {
     /// Starts a compressed stream.
     ///
     /// Nothing is written yet, and the compressor is built in place: handing
     /// it over inside a `Result` would have it copied, and drag `memcpy` in.
     #[inline(always)]
-    pub fn new(output: O, table: &'t mut [u16]) -> Self {
-        let mask = match table.len().checked_ilog2() {
-            Some(bits) => (1 << bits.min(16)) - 1,
-            None => 0,
-        };
+    pub fn new(output: O, table: T) -> Self {
+        Self::new_with(output, F::new(), table)
+    }
+
+    /// Starts a compressed stream, given its format: `Gzip::new()`,
+    /// `Zlib::new()` or `Raw::new()`.
+    ///
+    /// This is [`new`](Self::new) as a `const fn`, so a compressor owning its
+    /// table can be built in a `static` and never transit the stack.
+    #[inline(always)]
+    pub const fn new_with(output: O, format: F, table: T) -> Self {
         Compressor {
-            start: output.written(),
             out: output,
-            format: F::new(),
+            format,
             header: F::HEADER,
             table,
-            mask,
+            start: 0,
+            started: false,
             size: 0,
             bit_buf: 0,
             bit_cnt: 0,
+            _table: PhantomData,
         }
+    }
+
+    /// The output the compressed data goes to.
+    pub fn output(&self) -> &O {
+        &self.out
+    }
+
+    /// The output the compressed data goes to, to take what it holds or move
+    /// it along. The compressor only relies on its
+    /// [`written`](Output::written) count never going backwards.
+    pub fn output_mut(&mut self) -> &mut O {
+        &mut self.out
     }
 
     /// Compresses a chunk of data, as one deflate block.
@@ -87,9 +113,13 @@ impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
 
         // Not the final block, fixed Huffman codes.
         self.block(0b010)?;
+        let mask = match self.table.as_mut().len().checked_ilog2() {
+            Some(bits) => (1 << bits.min(16)) - 1,
+            None => 0,
+        };
         let mut pos = 0;
         while let Some(&byte) = data.get(pos) {
-            let (len, dist) = self.find(data, pos);
+            let (len, dist) = self.find(data, pos, mask);
             if len < MIN_MATCH {
                 self.symbol(byte as u32)?;
                 pos += 1;
@@ -145,9 +175,8 @@ impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
         }
         self.out.flush(&mut ())?;
 
-        let end = self.out.written();
-        let len = end - self.start;
-        self.start = end;
+        let len = self.out.written() - self.start;
+        self.started = false;
         self.format = F::new();
         self.header = F::HEADER;
         self.size = 0;
@@ -156,21 +185,28 @@ impl<'t, O: Output, F: Format> Compressor<'t, O, F> {
 
     /// Starts a block, after the header if this is the first.
     fn block(&mut self, kind: u32) -> Result<(), Error> {
+        if !self.started {
+            // Where the output is as the stream starts, for `finish` to
+            // measure the stream by. Taken here rather than in `new_with`,
+            // which is `const` and cannot ask.
+            self.start = self.out.written();
+            self.started = true;
+        }
         for &byte in core::mem::take(&mut self.header) {
             self.bits(byte as u32, 8)?;
         }
         self.bits(kind, 3)
     }
 
-    /// Looks for a match for the data at `pos`. Returns its length, zero if
-    /// there is none, and distance.
-    fn find(&mut self, data: &[u8], pos: usize) -> (usize, usize) {
+    /// Looks for a match for the data at `pos`, in the `mask + 1` entries of
+    /// the table. Returns its length, zero if there is none, and distance.
+    fn find(&mut self, data: &[u8], pos: usize, mask: usize) -> (usize, usize) {
         let ahead = data.get(pos..).unwrap_or(&[]);
         let Some(&[a, b, c]) = ahead.first_chunk() else {
             return (0, 0);
         };
         let hash = u32::from_le_bytes([a, b, c, 0]).wrapping_mul(0x9e37_79b1) >> 16;
-        let Some(entry) = self.table.get_mut(hash as usize & self.mask) else {
+        let Some(entry) = self.table.as_mut().get_mut(hash as usize & mask) else {
             return (0, 0);
         };
         let dist = (pos as u16).wrapping_sub(*entry) as usize;
