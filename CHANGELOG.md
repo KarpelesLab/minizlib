@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/KarpelesLab/minizlib/compare/v0.1.1...v0.1.2) - 2026-10-03
+
+### Added
+
+- const constructors with an all-zero initial state
+- output accessors, owned compressor tables and const constructors
+
+### Fixed
+
+- deprecate in favour of compcol, re-exporting its `embed::flate` ([#5](https://github.com/KarpelesLab/minizlib/pull/5))
+
+### Other
+
+- skip release-plz's semver check, blind to compcol re-exports ([#6](https://github.com/KarpelesLab/minizlib/pull/6))
+
 ## [0.1.1](https://github.com/KarpelesLab/minizlib/compare/v0.1.0...v0.1.1) - 2026-09-18
 
 ### Other
