@@ -3,3 +3,10 @@
 # Without this, release-plz publishes whenever the version in Cargo.toml is not
 # on crates.io yet, which includes the very first push of this workflow.
 release_always = false
+
+[[package]]
+name = "minizlib"
+# cargo-semver-checks cannot see items re-exported from another crate, and
+# everything here is re-exported from `compcol::embed::flate`: it reports the
+# whole API as removed. Version bumps follow the commit messages instead.
+semver_check = false
