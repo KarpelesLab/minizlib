@@ -80,29 +80,6 @@ jobs:
           cargo build --target ${{ matrix.target }} --no-default-features --features decompress,stored
           cargo build --target ${{ matrix.target }} --no-default-features --features compress
 
-  footprint:
-    # Guards the README's claims: builds a bare-metal binary around the crate
-    # in a range of configurations, and fails if any of them links panic
-    # machinery or needs static RAM. The sizes land in the job summary.
-    name: Footprint (no panics, code size)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: thumbv7em-none-eabi
-          components: llvm-tools
-
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: tools/footprint
-
-      - name: Measure
-        run: tools/footprint/check.sh | tee -a "$GITHUB_STEP_SUMMARY"
-
   msrv:
     name: MSRV (Rust 1.89)
     runs-on: ubuntu-latest

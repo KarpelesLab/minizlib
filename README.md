@@ -1,8 +1,22 @@
 # minizlib
 
+> **Deprecated: superseded by [compcol](https://crates.io/crates/compcol).**
+> minizlib's code now lives on as `compcol::embed::flate`, with the same API,
+> and from 0.1.2 on this crate only re-exports it. Nothing changes for code that
+> uses it, but it gets no further work. Depend on compcol instead:
+>
+> ```toml
+> compcol = { version = "0.7.2", default-features = false, features = ["embed", "gzip"] }
+> ```
+>
+> and `use compcol::embed::flate::*` where you had `use minizlib::*`. The
+> `checksum`, `crc-table`, `concat`, `stored`, `fixed` and `dynamic` features
+> are kept so existing feature lists build, but no longer change anything:
+> checksums are always verified, concatenated gzip members and all three block
+> types always decoded. Sizes are now held by compcol's CI.
+
 A tiny gzip / zlib / deflate compressor and decompressor for Rust: `no_std`, no
-allocation, no `unsafe`, no dependencies, no panics, and as little code as
-possible.
+allocation, no `unsafe`, no panics, and as little code as possible.
 
 Full gzip decompression links to **under 2.5 KB** of Thumb-2 code, compression
 to **about 1 KB**, and features let you strip that down further. Buffer in or
