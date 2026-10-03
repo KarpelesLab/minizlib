@@ -3,13 +3,13 @@ name = "minizlib"
 version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
-description = "Tiny no_std, no-alloc gzip / zlib / deflate compressor and decompressor"
+description = "Deprecated: superseded by compcol's `embed::flate`, which this crate now re-exports. Tiny no_std, no-alloc gzip / zlib / deflate"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/KarpelesLab/minizlib"
 keywords = ["gzip", "zlib", "deflate", "inflate", "no_std"]
 categories = ["compression", "no-std", "no-std::no-alloc", "embedded"]
-exclude = [".github", "tools", "release-plz.toml"]
+exclude = [".github", "release-plz.toml"]
 
 [features]
 default = [
@@ -29,18 +29,15 @@ decompress = []
 compress = []
 
 # Containers. Raw deflate is always available.
-gzip = []
-zlib = []
+gzip = ["compcol/gzip"]
+zlib = ["compcol/zlib"]
 
-# When decompressing, verify CRC-32 / ISIZE (gzip) and Adler-32 (zlib) trailers.
+# Kept so that existing feature lists still build; they no longer change
+# anything. compcol always verifies checksums, decodes concatenated gzip
+# members and all three block types, and uses the 16-entry CRC-32 table.
 checksum = []
-# Use a 256-entry CRC-32 table (1 KiB) instead of the 16-entry one (64 B).
 crc-table = []
-# Decode concatenated gzip members (`cat a.gz b.gz`) as one stream.
 concat = []
-
-# Deflate block types to decompress. Disabled ones decode to
-# `Error::Unsupported`. The compressor only emits `fixed`.
 stored = []
 fixed = []
 dynamic = []
@@ -52,6 +49,10 @@ required-features = ["compress", "gzip"]
 [[example]]
 name = "gunzip"
 required-features = ["decompress", "gzip", "zlib"]
+
+[dependencies]
+# The code lives on as compcol's `embed::flate`; this crate only re-exports it.
+compcol = { version = "0.7.2", default-features = false, features = ["embed", "deflate"] }
 
 [dev-dependencies]
 flate2 = "1"
