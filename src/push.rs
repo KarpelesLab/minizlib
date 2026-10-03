@@ -134,8 +134,10 @@ pub struct Decompressor<O, F> {
     out: O,
     format: F,
     state: State,
-    /// Where the output was when the stream started.
-    begin: u64,
+    /// Where the output was when the stream started. Two words rather than
+    /// a `u64`, so that the decompressor is 4-byte aligned and clearing one
+    /// is a job for `memclr4`, as for its context, rather than `memclr8`.
+    begin: [u32; 2],
     context: Context,
 }
 
@@ -143,24 +145,16 @@ impl<O: Output, F: Container> Decompressor<O, F> {
     /// Starts decompressing a stream.
     ///
     /// The decompressor is built in place: handing it over inside a `Result`
-    /// would have it copied, and drag `memcpy` in.
+    /// would have it copied, and drag `memcpy` in. This is a `const fn`, so
+    /// one can also be built in a `static` and never transit the stack,
+    /// which matters once its output holds a 32 KiB window; its initial
+    /// state is all zeros, given an output that is, so it lands in `.bss`.
     #[inline(always)]
-    pub fn new(output: O) -> Self {
-        Self::new_with(output, F::new())
-    }
-
-    /// Starts decompressing a stream, given its container: `Gzip::new()`,
-    /// `Zlib::new()`, `Raw::new()` or `Detect::new()`.
-    ///
-    /// This is [`new`](Self::new) as a `const fn`, so a decompressor can be
-    /// built in a `static` and never transit the stack, which matters once
-    /// its output holds a 32 KiB window.
-    #[inline(always)]
-    pub const fn new_with(output: O, format: F) -> Self {
+    pub const fn new(output: O) -> Self {
         Decompressor {
-            begin: 0,
+            begin: [0; 2],
             out: output,
-            format,
+            format: F::INIT,
             state: State::Start,
             context: Context {
                 bit_buf: 0,
@@ -228,8 +222,8 @@ impl<O: Output, F: Container> Decompressor<O, F> {
     pub fn finish(&mut self) -> Result<u64, Error> {
         let state = core::mem::replace(&mut self.state, State::Start);
         let end = self.out.written();
-        let len = end - self.begin;
-        self.begin = end;
+        let len = end - self.begin();
+        self.set_begin(end);
         self.format = F::new();
         self.context.bit_buf = 0;
         self.context.bit_cnt = 0;
@@ -240,13 +234,21 @@ impl<O: Output, F: Container> Decompressor<O, F> {
         }
     }
 
+    fn begin(&self) -> u64 {
+        (self.begin[1] as u64) << 32 | self.begin[0] as u64
+    }
+
+    fn set_begin(&mut self, begin: u64) {
+        self.begin = [begin as u32, (begin >> 32) as u32];
+    }
+
     /// Takes steps until the input or the stream runs out.
     fn run(&mut self, input: &mut &[u8]) -> Result<(), Error> {
         if matches!(self.state, State::Start) {
             // Where the output is as the stream starts, for `finish` to
-            // measure the stream by. Taken here rather than in `new_with`,
-            // which is `const` and cannot ask.
-            self.begin = self.out.written();
+            // measure the stream by. Taken here rather than in `new`, which
+            // is `const` and cannot ask.
+            self.set_begin(self.out.written());
         }
         let context = &mut self.context;
         let mut inflate = Inflate {

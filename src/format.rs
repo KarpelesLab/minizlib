@@ -14,13 +14,20 @@ mod sealed {
 /// A container for compressed data, to decompress from:
 /// [`Gzip`](struct.Gzip.html), [`Zlib`](struct.Zlib.html), [`Raw`], or
 /// [`Detect`](struct.Detect.html) for whichever of the first two comes.
-pub trait Container: sealed::Sealed + Checksum {
+pub trait Container: sealed::Sealed + Checksum + Sized {
     /// How many of the `trailer` words there are, at most. Zero means no
     /// header either.
     #[doc(hidden)]
     const TRAILER: usize;
+    /// A fresh container: no data seen yet. A constant, so that the codecs
+    /// can be built in `const` context, and all zeros, so that one built in
+    /// a `static` lands in `.bss`.
     #[doc(hidden)]
-    fn new() -> Self;
+    const INIT: Self;
+    #[doc(hidden)]
+    fn new() -> Self {
+        Self::INIT
+    }
     /// Whether a stream starting with `first` is a gzip one.
     #[doc(hidden)]
     fn detect(&mut self, first: u8) -> bool;
@@ -52,27 +59,9 @@ impl Checksum for Gzip {
 }
 
 #[cfg(feature = "gzip")]
-impl Gzip {
-    /// A fresh gzip container, for the `const` constructors that take one.
-    pub const fn new() -> Self {
-        Gzip(Crc32::new())
-    }
-}
-
-#[cfg(feature = "gzip")]
-impl Default for Gzip {
-    fn default() -> Self {
-        Gzip::new()
-    }
-}
-
-#[cfg(feature = "gzip")]
 impl Container for Gzip {
     const TRAILER: usize = 2;
-
-    fn new() -> Self {
-        Gzip::new()
-    }
+    const INIT: Self = Gzip(Crc32::new());
 
     fn detect(&mut self, _: u8) -> bool {
         true
@@ -104,27 +93,9 @@ impl Checksum for Zlib {
 }
 
 #[cfg(feature = "zlib")]
-impl Zlib {
-    /// A fresh zlib container, for the `const` constructors that take one.
-    pub const fn new() -> Self {
-        Zlib(Adler32::new())
-    }
-}
-
-#[cfg(feature = "zlib")]
-impl Default for Zlib {
-    fn default() -> Self {
-        Zlib::new()
-    }
-}
-
-#[cfg(feature = "zlib")]
 impl Container for Zlib {
     const TRAILER: usize = 1;
-
-    fn new() -> Self {
-        Zlib::new()
-    }
+    const INIT: Self = Zlib(Adler32::new());
 
     fn detect(&mut self, _: u8) -> bool {
         false
@@ -152,25 +123,9 @@ impl Checksum for Raw {
     fn update(&mut self, _: &[u8]) {}
 }
 
-impl Raw {
-    /// A fresh raw container, for the `const` constructors that take one.
-    pub const fn new() -> Self {
-        Raw
-    }
-}
-
-impl Default for Raw {
-    fn default() -> Self {
-        Raw::new()
-    }
-}
-
 impl Container for Raw {
     const TRAILER: usize = 0;
-
-    fn new() -> Self {
-        Raw::new()
-    }
+    const INIT: Self = Raw;
 
     fn detect(&mut self, _: u8) -> bool {
         false
@@ -207,32 +162,13 @@ impl Checksum for Detect {
 }
 
 #[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
-impl Detect {
-    /// A fresh container of either kind, for the `const` constructors that
-    /// take one.
-    pub const fn new() -> Self {
-        Detect {
-            gzip: Gzip::new(),
-            zlib: Zlib::new(),
-            is_gzip: false,
-        }
-    }
-}
-
-#[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
-impl Default for Detect {
-    fn default() -> Self {
-        Detect::new()
-    }
-}
-
-#[cfg(all(feature = "decompress", feature = "gzip", feature = "zlib"))]
 impl Container for Detect {
     const TRAILER: usize = 2;
-
-    fn new() -> Self {
-        Detect::new()
-    }
+    const INIT: Self = Detect {
+        gzip: Gzip::INIT,
+        zlib: Zlib::INIT,
+        is_gzip: false,
+    };
 
     fn detect(&mut self, first: u8) -> bool {
         // A zlib stream cannot start with 0x1f: the low nibble of its first

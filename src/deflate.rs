@@ -44,18 +44,27 @@ fn log2(value: u32) -> u32 {
 /// better, until they reach a few times deflate's 32 KiB reach. Each chunk
 /// also costs ten bits. When the chunks are not yours to choose, a
 /// [`BufferedCompressor`] gathers them.
+#[repr(C)]
 pub struct Compressor<'t, O, F, T = &'t mut [u16]> {
-    out: O,
-    format: F,
-    /// What is left to write of the header.
-    header: &'static [u8],
-    table: T,
-    /// Where the output was when the stream started, once `started`.
-    start: u64,
-    started: bool,
+    // The initial state is all zeros, so that a compressor built in a
+    // `static` lands in `.bss` and costs no flash. For one built on the
+    // stack, the fields that are zero at the start are laid out (this is
+    // `repr(C)`) so that no run of them, between the output and the table,
+    // is longer than four words: that many stores stay inline, where a
+    // longer run would become a `memclr` call to link for nothing.
     size: u32,
     bit_buf: u32,
+    out: O,
     bit_cnt: u32,
+    /// How much of the header has been written.
+    header: usize,
+    table: T,
+    /// Where the output was when the stream started, once `started`. Two
+    /// words rather than a `u64`, so that the compressor is 4-byte aligned
+    /// and clearing one is a job for `memclr4` rather than `memclr8`.
+    start: [u32; 2],
+    started: bool,
+    format: F,
     /// The lifetime of the table, for a borrowed one.
     _table: PhantomData<&'t mut [u16]>,
 }
@@ -65,28 +74,21 @@ impl<'t, O: Output, F: Format, T: AsMut<[u16]>> Compressor<'t, O, F, T> {
     ///
     /// Nothing is written yet, and the compressor is built in place: handing
     /// it over inside a `Result` would have it copied, and drag `memcpy` in.
+    /// This is a `const fn`, so one owning its table can also be built in a
+    /// `static` and never transit the stack; its initial state is all zeros,
+    /// given an output and a table that are, so it lands in `.bss`.
     #[inline(always)]
-    pub fn new(output: O, table: T) -> Self {
-        Self::new_with(output, F::new(), table)
-    }
-
-    /// Starts a compressed stream, given its format: `Gzip::new()`,
-    /// `Zlib::new()` or `Raw::new()`.
-    ///
-    /// This is [`new`](Self::new) as a `const fn`, so a compressor owning its
-    /// table can be built in a `static` and never transit the stack.
-    #[inline(always)]
-    pub const fn new_with(output: O, format: F, table: T) -> Self {
+    pub const fn new(output: O, table: T) -> Self {
         Compressor {
-            out: output,
-            format,
-            header: F::HEADER,
-            table,
-            start: 0,
-            started: false,
             size: 0,
             bit_buf: 0,
+            out: output,
             bit_cnt: 0,
+            header: 0,
+            table,
+            start: [0; 2],
+            started: false,
+            format: F::INIT,
             _table: PhantomData,
         }
     }
@@ -175,10 +177,11 @@ impl<'t, O: Output, F: Format, T: AsMut<[u16]>> Compressor<'t, O, F, T> {
         }
         self.out.flush(&mut ())?;
 
-        let len = self.out.written() - self.start;
+        let start = (self.start[1] as u64) << 32 | self.start[0] as u64;
+        let len = self.out.written() - start;
         self.started = false;
-        self.format = F::new();
-        self.header = F::HEADER;
+        self.format = F::INIT;
+        self.header = 0;
         self.size = 0;
         Ok(len)
     }
@@ -187,12 +190,15 @@ impl<'t, O: Output, F: Format, T: AsMut<[u16]>> Compressor<'t, O, F, T> {
     fn block(&mut self, kind: u32) -> Result<(), Error> {
         if !self.started {
             // Where the output is as the stream starts, for `finish` to
-            // measure the stream by. Taken here rather than in `new_with`,
-            // which is `const` and cannot ask.
-            self.start = self.out.written();
+            // measure the stream by. Taken here rather than in `new`, which
+            // is `const` and cannot ask.
+            let start = self.out.written();
+            self.start = [start as u32, (start >> 32) as u32];
             self.started = true;
         }
-        for &byte in core::mem::take(&mut self.header) {
+        let header = F::HEADER.get(self.header..).unwrap_or(&[]);
+        self.header = F::HEADER.len();
+        for &byte in header {
             self.bits(byte as u32, 8)?;
         }
         self.bits(kind, 3)

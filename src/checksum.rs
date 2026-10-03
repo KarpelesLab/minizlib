@@ -43,21 +43,24 @@ mod crc32 {
     #[cfg(not(feature = "crc-table"))]
     static TABLE: [u32; 16] = table();
 
+    /// The CRC-32 so far, stored complemented, so that the initial state is
+    /// zero: a codec built in a `static` then lands in `.bss` rather than
+    /// in `.data`, and costs no flash.
     pub(crate) struct Crc32(u32);
 
     impl Crc32 {
         pub(crate) const fn new() -> Self {
-            Crc32(!0)
+            Crc32(0)
         }
 
         pub(crate) fn value(&self) -> u32 {
-            !self.0
+            self.0
         }
     }
 
     impl super::Checksum for Crc32 {
         fn update(&mut self, data: &[u8]) {
-            let mut c = self.0;
+            let mut c = !self.0;
             for &b in data {
                 c ^= b as u32;
                 #[cfg(feature = "crc-table")]
@@ -70,11 +73,14 @@ mod crc32 {
                     c = TABLE[(c & 0xf) as usize] ^ (c >> 4);
                 }
             }
-            self.0 = c;
+            self.0 = !c;
         }
     }
 }
 
+/// The Adler-32 so far, `a` stored one less than it is (wrapping), so that
+/// the initial state is zero: a codec built in a `static` then lands in
+/// `.bss` rather than in `.data`, and costs no flash.
 #[cfg(feature = "zlib")]
 pub(crate) struct Adler32 {
     a: u32,
@@ -84,25 +90,29 @@ pub(crate) struct Adler32 {
 #[cfg(feature = "zlib")]
 impl Adler32 {
     pub(crate) const fn new() -> Self {
-        Adler32 { a: 1, b: 0 }
+        Adler32 { a: 0, b: 0 }
     }
 
     pub(crate) fn value(&self) -> u32 {
-        self.b << 16 | self.a
+        self.b << 16 | self.a.wrapping_add(1)
     }
 }
 
 #[cfg(feature = "zlib")]
 impl Checksum for Adler32 {
     fn update(&mut self, data: &[u8]) {
+        let mut a = self.a.wrapping_add(1);
+        let mut b = self.b;
         // 5552 is the most bytes that can be summed before `b` overflows.
         for chunk in data.chunks(5552) {
             for &x in chunk {
-                self.a += x as u32;
-                self.b += self.a;
+                a += x as u32;
+                b += a;
             }
-            self.a %= 65521;
-            self.b %= 65521;
+            a %= 65521;
+            b %= 65521;
         }
+        self.a = a.wrapping_sub(1);
+        self.b = b;
     }
 }
